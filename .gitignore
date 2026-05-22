@@ -1,0 +1,16 @@
+# Go build artifacts
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Editor/OS noise
+*.bak
+*~
+*.tmp
+.DS_Store
+
+# Shared libraries (cgo etc.)
+*.dylib
+*.so
+*.dll
