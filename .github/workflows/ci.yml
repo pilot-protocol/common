@@ -23,6 +23,15 @@ jobs:
       - name: Run tests with coverage
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.out
+          flags: unittests
+          name: common
+          fail_ci_if_error: false
+        # No token needed — Codecov GitHub App is installed on the org.
+
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -20
 
