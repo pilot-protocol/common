@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -102,7 +103,25 @@ func SaveIdentity(path string, id *Identity) error {
 
 // LoadIdentity reads an identity keypair from a JSON file.
 // Returns nil, nil if the file does not exist (first run).
+//
+// Emits a WARN (does NOT refuse) when the file's mode permits group
+// or other access. The identity file contains the Ed25519 private
+// key; SaveIdentity always writes 0o600, but an operator who created
+// the file by hand or restored from a permissive backup can end up
+// with 0o644 — group/other readable. The warning gives them a signal
+// to chmod 600 without breaking existing deployments. A future
+// release can promote the warning to a refusal once the fleet has
+// had a release cycle to tighten permissions.
 func LoadIdentity(path string) (*Identity, error) {
+	if fi, statErr := os.Stat(path); statErr == nil {
+		if fi.Mode().Perm()&0o077 != 0 {
+			slog.Warn("identity file has loose permissions; chmod 600 recommended",
+				"path", path,
+				"mode", fmt.Sprintf("%o", fi.Mode().Perm()),
+			)
+		}
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

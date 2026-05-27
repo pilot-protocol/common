@@ -5,6 +5,7 @@ package fsutil
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // AppendSync appends data to a file and fsyncs it. Used by the WAL for
@@ -47,5 +48,20 @@ func AtomicWrite(path string, data []byte) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// fsync the parent directory so the rename's directory-entry
+	// update is durable on power loss. Without this, the file blocks
+	// are persisted (we fsync'd them above) but the directory inode
+	// may still point at the old (now-orphaned) inode after crash —
+	// "successful" AtomicWrite + recoverable file == path missing.
+	// Best-effort: a fsync failure on the directory does not fail
+	// the whole operation; the data is on disk, only the directory
+	// entry is at risk.
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
