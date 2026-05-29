@@ -128,3 +128,64 @@ func TestL11PluginPanicCallbackPanicSwallowed(t *testing.T) {
 		t.Fatal("L11 boundary did not record the primary panic")
 	}
 }
+
+// TestL11PerPluginUnhealthy verifies per-plugin panic tracking
+// and the unhealthy-signal fires once when the threshold is crossed.
+func TestL11PerPluginUnhealthy(t *testing.T) {
+	ResetPluginHealthForTest()
+	bus := &fakeBus{}
+	const name = "unstable-plugin"
+
+	if !IsPluginHealthy(name) || PluginPanicCount(name) != 0 {
+		t.Fatal("fresh plugin unhealthy or non-zero count")
+	}
+
+	// Induce panics up to threshold-1; plugin stays healthy.
+	boom := func() {
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		go func() { defer wg.Done(); defer RecoverPlugin(name, "loop", bus, nil); panic("x") }()
+		wg.Wait()
+	}
+	for i := 1; i < maxPanicsBeforeUnhealthy; i++ {
+		boom()
+		if got := PluginPanicCount(name); got != uint64(i) || !IsPluginHealthy(name) {
+			t.Fatalf("panic %d: count=%d healthy=%v", i, got, IsPluginHealthy(name))
+		}
+	}
+
+	// Threshold-crossing panic makes plugin unhealthy + fires event.
+	boom()
+	if IsPluginHealthy(name) {
+		t.Fatal("plugin should be unhealthy after threshold")
+	}
+	found := false
+	for _, tp := range bus.topics {
+		if tp == "plugin."+name+".unhealthy" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("unhealthy event missing, topics: %v", bus.topics)
+	}
+
+	// One-shot: extra panic does not re-fire unhealthy.
+	before := 0
+	for _, tp := range bus.topics {
+		if tp == "plugin."+name+".unhealthy" {
+			before++
+		}
+	}
+	boom()
+	after := 0
+	for _, tp := range bus.topics {
+		if tp == "plugin."+name+".unhealthy" {
+			after++
+		}
+	}
+	if after != before {
+		t.Fatalf("unhealthy event re-fired (%d→%d)", before, after)
+	}
+	ResetPluginHealthForTest()
+}
