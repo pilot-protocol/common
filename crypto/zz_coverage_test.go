@@ -5,7 +5,6 @@ package crypto
 import (
 	"bytes"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,14 +13,10 @@ import (
 	"testing"
 )
 
-// TestLoadIdentity_LoosePermissionsWarn covers the slog.Warn branch in
-// LoadIdentity that fires when the on-disk file is group/other-readable.
-//
-// We swap the default slog handler for one that writes to a buffer so we
-// can assert the warning was emitted, then restore it.
-func TestLoadIdentity_LoosePermissionsWarn(t *testing.T) {
-	// NOTE: not t.Parallel() — we mutate the global slog default logger
-	// and need to restore it cleanly.
+// TestLoadIdentity_LoosePermissionsError checks that LoadIdentity
+// refuses to load an identity file with group/other-readable permissions.
+func TestLoadIdentity_LoosePermissionsError(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("unix file permissions only")
 	}
@@ -35,46 +30,39 @@ func TestLoadIdentity_LoosePermissionsWarn(t *testing.T) {
 	if err := SaveIdentity(path, id); err != nil {
 		t.Fatalf("SaveIdentity: %v", err)
 	}
-	// Loosen permissions so the warn branch trips.
+	// Loosen permissions so the error branch trips.
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatalf("Chmod: %v", err)
 	}
 
-	var buf bytes.Buffer
-	origLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(origLogger) })
-
-	loaded, err := LoadIdentity(path)
-	if err != nil {
-		t.Fatalf("LoadIdentity: %v", err)
+	_, err = LoadIdentity(path)
+	if err == nil {
+		t.Fatal("expected error for loose permissions (0o644)")
 	}
-	if loaded == nil {
-		t.Fatal("LoadIdentity returned nil")
+	if !strings.Contains(err.Error(), "loose permissions") {
+		t.Fatalf("error %q missing 'loose permissions'", err)
 	}
-	if !strings.Contains(buf.String(), "loose permissions") {
-		t.Fatalf("expected 'loose permissions' warning, got log: %q", buf.String())
-	}
-	if !strings.Contains(buf.String(), "level=WARN") {
-		t.Fatalf("expected WARN level, got log: %q", buf.String())
+	if !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("error %q missing 'chmod 600' instruction", err)
 	}
 }
 
 // TestLoadIdentity_ReadFileNonNotExistError covers the os.ReadFile
-// error branch where the error is *not* IsNotExist. Pointing the path
-// at a directory triggers EISDIR from read(2), which os.IsNotExist
-// returns false for, so the wrapped "read identity" path is exercised.
+// error branch where the error is *not* IsNotExist. We create a
+// directory with strict 0o700 perms (passes the permissions gate),
+// then os.ReadFile on the directory fails with EISDIR.
 func TestLoadIdentity_ReadFileNonNotExistError(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("EISDIR is unix-specific")
 	}
 	dir := t.TempDir()
-	// `dir` itself is a directory; os.Stat succeeds, os.ReadFile fails
-	// with a non-NotExist error. The mode bits on a directory include
-	// the executable bit for group/other (0o755 typical for TempDir),
-	// which is harmless for this test — slog default discards.
-	_, err := LoadIdentity(dir)
+	// Create a subdirectory with strict perms that passes the gate.
+	subdir := filepath.Join(dir, "subdir")
+	if err := os.MkdirAll(subdir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	_, err := LoadIdentity(subdir)
 	if err == nil {
 		t.Fatal("expected read error against a directory path")
 	}
@@ -83,9 +71,10 @@ func TestLoadIdentity_ReadFileNonNotExistError(t *testing.T) {
 	}
 }
 
-// TestLoadIdentity_PermsExactly600NoWarn confirms the *negative* case:
-// a strict 0o600 file does NOT trip the warn branch.
-func TestLoadIdentity_PermsExactly600NoWarn(t *testing.T) {
+// TestLoadIdentity_PermsExactly600OK confirms that a strict 0o600 file
+// loads successfully (passes the permissions gate).
+func TestLoadIdentity_PermsExactly600OK(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("unix file permissions only")
 	}
@@ -100,16 +89,8 @@ func TestLoadIdentity_PermsExactly600NoWarn(t *testing.T) {
 		t.Fatalf("Chmod: %v", err)
 	}
 
-	var buf bytes.Buffer
-	origLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(origLogger) })
-
 	if _, err := LoadIdentity(path); err != nil {
-		t.Fatalf("LoadIdentity: %v", err)
-	}
-	if strings.Contains(buf.String(), "loose permissions") {
-		t.Fatalf("did not expect warn for 0o600, got log: %q", buf.String())
+		t.Fatalf("LoadIdentity with 0o600 should succeed: %v", err)
 	}
 }
 
