@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/pilot-protocol/common/fsutil"
 )
 
 // Identity holds an Ed25519 keypair for a node.
@@ -95,7 +97,9 @@ func SaveIdentity(path string, id *Identity) error {
 		return fmt.Errorf("marshal identity: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	// AtomicWrite prevents a truncated identity file from a crash
+	// mid-write (temp + rename + fsync pattern).
+	if err := fsutil.AtomicWrite(path, data); err != nil {
 		return fmt.Errorf("write identity: %w", err)
 	}
 	return nil
