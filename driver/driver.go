@@ -455,13 +455,23 @@ func (d *Driver) PolicyGet(networkID uint16) (map[string]interface{}, error) {
 }
 
 // PolicySet sends a policy document to the daemon for immediate application.
-func (d *Driver) PolicySet(networkID uint16, policyJSON []byte) (map[string]interface{}, error) {
-	msg := make([]byte, 5+len(policyJSON))
+// adminToken authenticates the caller as a network administrator —
+// pilot-daemon's managed.policy.set IPC handler validates this against
+// its configured AdminToken before applying the policy. Empty token is
+// accepted by the daemon iff it has no AdminToken configured (default
+// solo-mode daemons); managed-mode daemons reject empty tokens.
+// (PILOT-233)
+func (d *Driver) PolicySet(networkID uint16, policyJSON []byte, adminToken string) (map[string]interface{}, error) {
+	// Wire: [cmd][sub][action=0x01][netID(2)][tokenLen(2)][token...][policyJSON...]
+	tokenLen := len(adminToken)
+	msg := make([]byte, 7+tokenLen+len(policyJSON))
 	msg[0] = cmdManaged
 	msg[1] = subManagedPolicy
 	msg[2] = 0x01 // set
 	binary.BigEndian.PutUint16(msg[3:5], networkID)
-	copy(msg[5:], policyJSON)
+	binary.BigEndian.PutUint16(msg[5:7], uint16(tokenLen))
+	copy(msg[7:7+tokenLen], []byte(adminToken))
+	copy(msg[7+tokenLen:], policyJSON)
 	return d.jsonRPC(msg, cmdManagedOK, "policy set")
 }
 
