@@ -121,9 +121,33 @@ func startWithPanicRecovery(ctx context.Context, s Service, deps Deps) (err erro
 	return s.Start(ctx, deps)
 }
 
-// StopAll stops every started service in reverse order. Errors from
-// individual Stop calls are collected; the first one is returned but
-// every service still gets its Stop call invoked.
+// stopWithPanicRecovery calls s.Stop(ctx) inside a defer recover()
+// so a buggy plugin panicking during shutdown (channel-send on closed
+// channel, nil dereference, os.Remove of a path whose parent dir
+// vanished) surfaces as a normal Stop error rather than crashing the
+// entire daemon process mid-teardown.
+//
+// Without this wrapper, a plugin that panics in Stop propagates the
+// panic up through StopAll, terminating the daemon before remaining
+// plugins get their Stop calls — leaving orphaned goroutines, half-
+// written on-disk state, and no tear-down log.
+func stopWithPanicRecovery(ctx context.Context, s Service) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("plugin %q Stop panicked: %v", s.Name(), r)
+		}
+	}()
+	return s.Stop(ctx)
+}
+
+// StopAll stops every started service in reverse order. Each Stop is
+// wrapped in stopWithPanicRecovery so a buggy plugin panicking during
+// shutdown cannot crash the daemon; the panic is converted to an error
+// and all remaining services still get their Stop call.
+//
+// Errors from individual Stop calls (including recovered panics) are
+// collected; the first one is returned but every service still gets
+// its Stop call invoked.
 func (sr *ServiceRegistry) StopAll(ctx context.Context) error {
 	sr.mu.Lock()
 	queue := append([]Service(nil), sr.started...)
@@ -132,7 +156,7 @@ func (sr *ServiceRegistry) StopAll(ctx context.Context) error {
 
 	var firstErr error
 	for i := len(queue) - 1; i >= 0; i-- {
-		if err := queue[i].Stop(ctx); err != nil && firstErr == nil {
+		if err := stopWithPanicRecovery(ctx, queue[i]); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
