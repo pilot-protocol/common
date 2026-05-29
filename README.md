@@ -42,3 +42,4 @@ ok := crypto.Verify(id.PublicKey, msg, sig)
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).
 
+// fix typo in docs
