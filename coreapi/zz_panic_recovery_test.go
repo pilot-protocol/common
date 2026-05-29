@@ -29,6 +29,88 @@ func (p *panickingService) Order() int                                    { retu
 func (p *panickingService) Start(_ context.Context, _ coreapi.Deps) error { panic(p.msg) }
 func (p *panickingService) Stop(_ context.Context) error                  { return nil }
 
+// panickingStop panics during Stop with the given message.
+type panickingStop struct{ msg string }
+
+func (p *panickingStop) Name() string                                  { return "panicker-stop" }
+func (p *panickingStop) Order() int                                    { return 100 }
+func (p *panickingStop) Start(_ context.Context, _ coreapi.Deps) error { return nil }
+func (p *panickingStop) Stop(_ context.Context) error                  { panic(p.msg) }
+
+func TestServiceRegistry_StopAllRecoversFromPluginPanic(t *testing.T) {
+	t.Parallel()
+
+	sr := &coreapi.ServiceRegistry{}
+	if err := sr.Register(&panickingStop{msg: "boom during shutdown"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Start first so the service is in the started queue.
+	if err := sr.StartAll(context.Background(), coreapi.Deps{}); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	// Without the recover wrapper in StopAll, this CRASHES the test process.
+	err := sr.StopAll(context.Background())
+
+	if err == nil {
+		t.Fatal("StopAll returned nil for panicking plugin — recover wrapper missing")
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Errorf("expected error to mention 'panic'; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "boom during shutdown") {
+		t.Errorf("expected error to include the panic message; got %q", err.Error())
+	}
+}
+
+// stopThenPanic panics during Stop AFTER calling an observer so the
+// test can verify downstream services still get their Stop calls.
+type stopThenPanic struct {
+	name   string
+	order  int
+	called *bool
+	msg    string
+}
+
+func (s *stopThenPanic) Name() string                                  { return s.name }
+func (s *stopThenPanic) Order() int                                    { return s.order }
+func (s *stopThenPanic) Start(_ context.Context, _ coreapi.Deps) error { return nil }
+func (s *stopThenPanic) Stop(_ context.Context) error {
+	*s.called = true
+	panic(s.msg)
+}
+
+func TestServiceRegistry_StopAllContinuesAfterPanic(t *testing.T) {
+	t.Parallel()
+
+	sr := &coreapi.ServiceRegistry{}
+
+	laterCalled := false
+	panicker := &stopThenPanic{name: "panicker", order: 50, called: new(bool), msg: "crash"}
+	later := &stopThenPanic{name: "later", order: 100, called: &laterCalled, msg: ""}
+
+	// later.Order > panicker.Order → later stops first (reverse order).
+	// panicker panics in Stop; later should already have been stopped.
+	for _, s := range []coreapi.Service{panicker, later} {
+		if err := sr.Register(s); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+	}
+
+	if err := sr.StartAll(context.Background(), coreapi.Deps{}); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+
+	_ = sr.StopAll(context.Background())
+
+	// later must have been stopped despite panicker panicking earlier
+	// (later starts first, so it stops first — reverse order).
+	if !laterCalled {
+		t.Error("downstream service was not stopped after panicker; StopAll aborted early")
+	}
+}
+
 func TestServiceRegistry_StartAllRecoversFromPluginPanic(t *testing.T) {
 	t.Parallel()
 
