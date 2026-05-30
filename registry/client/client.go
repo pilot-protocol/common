@@ -442,8 +442,12 @@ func (c *Client) sendOnEntry(entry *pooledConn, msg map[string]interface{}) (map
 	if err != nil {
 		return nil, fmt.Errorf("recv: %w", err)
 	}
-	if errMsg, ok := resp["error"].(string); ok {
-		return resp, fmt.Errorf("registry: %s", errMsg)
+	if errVal, ok := resp["error"]; ok {
+		return resp, fmt.Errorf("registry: %v", errVal)
+	}
+	// PILOT-132: reject valid JSON that lacks the expected "type" envelope key.
+	if _, hasType := resp["type"]; !hasType && len(resp) > 0 {
+		return resp, fmt.Errorf("registry: malformed response (missing %q field)", "type")
 	}
 	return resp, nil
 }
@@ -514,8 +518,12 @@ func (c *Client) sendLocked(msg map[string]interface{}) (map[string]interface{},
 	if err != nil {
 		return nil, fmt.Errorf("recv: %w", err)
 	}
-	if errMsg, ok := resp["error"].(string); ok {
-		return resp, fmt.Errorf("registry: %s", errMsg)
+	if errVal, ok := resp["error"]; ok {
+		return resp, fmt.Errorf("registry: %v", errVal)
+	}
+	// PILOT-132: reject valid JSON that lacks the expected "type" envelope key.
+	if _, hasType := resp["type"]; !hasType && len(resp) > 0 {
+		return resp, fmt.Errorf("registry: malformed response (missing %q field)", "type")
 	}
 	return resp, nil
 }
