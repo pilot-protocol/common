@@ -79,9 +79,46 @@ type identityFile struct {
 	PublicKey  string `json:"public_key"`
 }
 
+// resolvePath resolves any symlinks in the given path. Intermediate
+// directories are resolved via filepath.EvalSymlinks; if the final
+// component is a symlink it is followed via os.Readlink.
+func resolvePath(path string) string {
+	// Fast path: EvalSymlinks succeeds when all components exist.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+
+	// EvalSymlinks failed (likely final component doesn't exist).
+	// Resolve the parent directory and re-join with the base name.
+	parent := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return path // can't resolve even the parent
+	}
+
+	resolved := filepath.Join(resolvedParent, base)
+
+	// If the final component is itself a symlink (pointing to a
+	// non-existent target), follow it via Readlink.
+	if fi, err := os.Lstat(resolved); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if target, err := os.Readlink(resolved); err == nil {
+			if filepath.IsAbs(target) {
+				return target
+			}
+			return filepath.Join(resolvedParent, target)
+		}
+	}
+
+	return resolved
+}
+
 // SaveIdentity writes the identity keypair to a JSON file.
 // Creates parent directories if needed. File is written with mode 0600.
 func SaveIdentity(path string, id *Identity) error {
+	path = resolvePath(path)
+
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("create identity dir: %w", err)
 	}
@@ -113,6 +150,8 @@ func SaveIdentity(path string, id *Identity) error {
 // or restored from a permissive backup can end up with 0o644.
 // Remediation: chmod 600 <path>.
 func LoadIdentity(path string) (*Identity, error) {
+	path = resolvePath(path)
+
 	if fi, statErr := os.Stat(path); statErr == nil {
 		if fi.Mode().Perm()&0o077 != 0 {
 			return nil, fmt.Errorf("identity file has loose permissions (mode %o); chmod 600 %s and retry",
