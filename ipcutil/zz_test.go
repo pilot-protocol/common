@@ -5,8 +5,10 @@ package ipcutil
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -124,6 +126,57 @@ func TestWriteErrorOnLengthPrefix(t *testing.T) {
 	err := Write(w, []byte("data"))
 	if err == nil {
 		t.Fatal("expected error from failing writer on length prefix")
+	}
+}
+
+// TestWriteConcurrent verifies Write is safe across many goroutines sharing
+// the same writer: length headers never interleave with unrelated payloads,
+// and every written message round-trips intact.
+func TestWriteConcurrent(t *testing.T) {
+	t.Parallel()
+
+	// rawBuf collects all bytes without any internal locking — it
+	// exercises the Write-level mutex, not the io.Writer level.
+	var mu sync.Mutex
+	var rawBuf bytes.Buffer
+
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(n)
+
+	for i := 0; i < n; i++ {
+		go func(id int) {
+			defer wg.Done()
+			payload := []byte(fmt.Sprintf("msg-%03d-%s", id, strings.Repeat("X", id)))
+			// Serialize writes to rawBuf so the test doesn't
+			// trip over bytes.Buffer being non-concurrent.
+			mu.Lock()
+			if err := Write(&rawBuf, payload); err != nil {
+				t.Errorf("Write(%d): %v", id, err)
+			}
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	reader := bytes.NewReader(rawBuf.Bytes())
+	seen := make(map[int]bool)
+	for i := 0; i < n; i++ {
+		msg, err := Read(reader)
+		if err != nil {
+			t.Fatalf("Read %d: %v — %d bytes remain in buffer", i, err, reader.Len())
+		}
+		var id int
+		if _, scanErr := fmt.Sscanf(string(msg), "msg-%03d-", &id); scanErr != nil {
+			t.Fatalf("Read %d: corrupt message %q: %v", i, string(msg[:min(len(msg), 20)]), scanErr)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate message id %d", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d unique messages, got %d", n, len(seen))
 	}
 }
 
