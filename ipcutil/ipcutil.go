@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // MaxMessageSize is the maximum IPC message size (1MB).
@@ -29,7 +30,13 @@ func Read(r io.Reader) ([]byte, error) {
 }
 
 // Write writes a length-prefixed IPC message to w.
+// It is safe for concurrent use: the length prefix and payload are
+// written as an atomic unit, preventing interleaving when callers
+// share the same writer across goroutines.
 func Write(w io.Writer, data []byte) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 	if _, err := w.Write(lenBuf[:]); err != nil {
@@ -38,3 +45,5 @@ func Write(w io.Writer, data []byte) error {
 	_, err := w.Write(data)
 	return err
 }
+
+var writeMu sync.Mutex
