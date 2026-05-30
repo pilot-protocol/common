@@ -179,6 +179,58 @@ func TestSaveLoad_ConcurrentReaders(t *testing.T) {
 	}
 }
 
+// TestSaveLoad_SymlinkResolution ensures SaveIdentity and LoadIdentity
+// canonicalize the path via filepath.EvalSymlinks, preventing writes
+// through a symlink to an unintended directory.
+func TestSaveLoad_SymlinkResolution(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks require unix")
+	}
+
+	// Create two directories: "real" (where the file should land) and
+	// "linkdir" (the symlink target directory).
+	realDir := filepath.Join(t.TempDir(), "real")
+	if err := os.MkdirAll(realDir, 0700); err != nil {
+		t.Fatalf("MkdirAll realDir: %v", err)
+	}
+	linkDir := filepath.Join(t.TempDir(), "linkdir")
+	if err := os.MkdirAll(linkDir, 0700); err != nil {
+		t.Fatalf("MkdirAll linkDir: %v", err)
+	}
+
+	// Create a symlink: linkdir/id.json → realDir/id.json.
+	targetPath := filepath.Join(realDir, "id.json")
+	linkPath := filepath.Join(linkDir, "id.json")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	// Save via the symlink path — file should land at the resolved target.
+	id, err := GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	if err := SaveIdentity(linkPath, id); err != nil {
+		t.Fatalf("SaveIdentity via symlink: %v", err)
+	}
+
+	// The file must be at the resolved target path, not a new inode at the
+	// symlink location.
+	if _, err := os.Stat(targetPath); err != nil {
+		t.Fatalf("identity not at resolved target path: %v", err)
+	}
+
+	// Load via the symlink path must succeed and return the saved identity.
+	loaded, err := LoadIdentity(linkPath)
+	if err != nil {
+		t.Fatalf("LoadIdentity via symlink: %v", err)
+	}
+	if !loaded.PublicKey.Equal(id.PublicKey) {
+		t.Error("public key mismatch after symlink roundtrip")
+	}
+}
+
 // TestSaveLoad_OverwriteExisting ensures SaveIdentity over an existing
 // file replaces it with the new keypair (no append, no merge).
 func TestSaveLoad_OverwriteExisting(t *testing.T) {
