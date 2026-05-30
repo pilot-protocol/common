@@ -416,6 +416,57 @@ func TestSendOnEntryReturnsServerErrorResponse(t *testing.T) {
 	}
 }
 
+// TestSendOnEntryReturnsErrorOnNonStringError verifies that a server error
+// value of a non-string type (e.g. int) is still treated as an error (PILOT-132).
+// Previously only resp["error"].(string) would trigger, silently swallowing
+// numeric or object error values.
+func TestSendOnEntryReturnsErrorOnNonStringError(t *testing.T) {
+	t.Parallel()
+	srv := newFakeJSONServer(t, func(_ map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{"error": float64(403)}
+	})
+	defer srv.close()
+
+	c, err := DialPool(srv.addr(), 2)
+	if err != nil {
+		t.Fatalf("DialPool: %v", err)
+	}
+	defer c.Close()
+
+	_, err = c.Send(map[string]interface{}{"type": "x"})
+	if err == nil {
+		t.Fatalf("expected error for non-string error value")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Fatalf("error should contain the numeric error value 403, got: %v", err)
+	}
+}
+
+// TestSendReturnsErrorOnMalformedResponse verifies that a valid-JSON response
+// that lacks both an "error" key and a "type" key is treated as a protocol
+// violation, not silently accepted (PILOT-132).
+func TestSendReturnsErrorOnMalformedResponse(t *testing.T) {
+	t.Parallel()
+	srv := newFakeJSONServer(t, func(_ map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{"unexpected": "key"}
+	})
+	defer srv.close()
+
+	c, err := Dial(srv.addr())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	_, err = c.Send(map[string]interface{}{"type": "ping"})
+	if err == nil {
+		t.Fatalf("expected error for malformed response (missing 'type' key)")
+	}
+	if !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("error should describe malformed response: %v", err)
+	}
+}
+
 // --- DialTLS happy path ---------------------------------------------------
 
 func TestDialTLSHappyPathConnects(t *testing.T) {
