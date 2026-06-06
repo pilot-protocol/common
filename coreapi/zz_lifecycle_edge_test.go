@@ -59,6 +59,40 @@ func TestServiceRegistry_StopAllStopsAllEvenAfterError(t *testing.T) {
 	}
 }
 
+func TestServiceRegistry_StopAllTimingOutHangingPlugin(t *testing.T) {
+	t.Parallel()
+	sr := &coreapi.ServiceRegistry{}
+	bStopped := false
+	a := &hangingService{name: "a", order: 1}
+	bb := &recordingStopWithErr{name: "b", order: 2, stopped: &bStopped}
+	_ = sr.Register(a)
+	_ = sr.Register(bb)
+	_ = sr.StartAll(context.Background(), coreapi.Deps{})
+	// StopAll should not block forever; the hanging plugin should time out
+	err := sr.StopAll(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("StopAll = %v, want DeadlineExceeded from hung plugin a", err)
+	}
+	if !bStopped {
+		t.Error("service b was not stopped despite a hanging")
+	}
+}
+
+// hangingService never returns from Stop — simulates a plugin that
+// blocks indefinitely, used to verify per-plugin timeout in StopAll.
+type hangingService struct {
+	name  string
+	order int
+}
+
+func (h *hangingService) Name() string                                       { return h.name }
+func (h *hangingService) Order() int                                         { return h.order }
+func (h *hangingService) Start(ctx context.Context, deps coreapi.Deps) error { return nil }
+func (h *hangingService) Stop(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 type recordingStopWithErr struct {
 	name    string
 	order   int

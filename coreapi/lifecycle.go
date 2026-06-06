@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Service is the lifecycle contract every L11 plugin implements.
@@ -145,9 +146,15 @@ func stopWithPanicRecovery(ctx context.Context, s Service) (err error) {
 // shutdown cannot crash the daemon; the panic is converted to an error
 // and all remaining services still get their Stop call.
 //
-// Errors from individual Stop calls (including recovered panics) are
-// collected; the first one is returned but every service still gets
-// its Stop call invoked.
+// To prevent one hung plugin from blocking the entire shutdown sequence,
+// each per-plugin Stop call is given its own 5-second timeout via a
+// per-plugin context derived from the parent. If a plugin exceeds its
+// deadline, context.DeadlineExceeded is surfaced as a Stop error and
+// remaining plugins continue shutting down.
+//
+// Errors from individual Stop calls (including recovered panics and
+// deadline expirations) are collected; the first one is returned but
+// every service still gets its Stop call invoked.
 func (sr *ServiceRegistry) StopAll(ctx context.Context) error {
 	sr.mu.Lock()
 	queue := append([]Service(nil), sr.started...)
@@ -156,7 +163,10 @@ func (sr *ServiceRegistry) StopAll(ctx context.Context) error {
 
 	var firstErr error
 	for i := len(queue) - 1; i >= 0; i-- {
-		if err := stopWithPanicRecovery(ctx, queue[i]); err != nil && firstErr == nil {
+		pluginCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := stopWithPanicRecovery(pluginCtx, queue[i])
+		cancel()
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
