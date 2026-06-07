@@ -182,9 +182,15 @@ func TestWriteConcurrent(t *testing.T) {
 
 func TestWriteErrorOnPayload(t *testing.T) {
 	t.Parallel()
-	w := &errWriter{failAfter: 1} // first write (length) succeeds, second (payload) fails
+	// Write now emits length+payload in a single w.Write call (see
+	// ipcutil.go Write rationale). The earlier "failAfter: 1" guarded
+	// the length-then-payload sequence; the combined frame collapses
+	// that into one syscall, so the failing-writer scenario is
+	// "underlying Write returns an error" regardless of which byte
+	// range it died on.
+	w := &errWriter{failAfter: 0}
 	err := Write(w, []byte("data"))
 	if err == nil {
-		t.Fatal("expected error from failing writer on payload")
+		t.Fatal("expected error from failing writer")
 	}
 }
