@@ -282,6 +282,29 @@ func (d *Driver) RevokeTrust(nodeID uint32) (map[string]interface{}, error) {
 	return d.jsonRPC(msg, cmdHandshakeOK, "revoke")
 }
 
+// PreferDirect asks the daemon to drop the existing tunnel to the peer
+// and any sticky routing state (cached endpoint, cached resolve, unpinned
+// relay flag), then re-resolve from the registry and prefer a direct UDP
+// path on the next dial. Returns the new routing state the daemon arrived
+// at — typically {"node_id": N, "relay_active": false, "pinned": false,
+// "real_addr": "..."} when a direct path was found, or relay_active=true
+// when the registry's relay_only flag is authoritative or the punch
+// failed.
+//
+// Useful when stream traffic (pilotctl send-file) is failing on a relay
+// path while small UDP (pilotctl ping) still works — typical symptom of
+// a beacon-mediated tunnel that established once and then stuck.
+//
+// Backward compatibility: an old daemon (no CmdPreferDirect) returns an
+// "unknown command" error — callers should treat that as "best-effort
+// hint" and proceed with the normal dial, not abort the operation.
+func (d *Driver) PreferDirect(nodeID uint32) (map[string]interface{}, error) {
+	msg := make([]byte, 5)
+	msg[0] = cmdPreferDirect
+	binary.BigEndian.PutUint32(msg[1:5], nodeID)
+	return d.jsonRPC(msg, cmdPreferDirectOK, "prefer_direct")
+}
+
 // ResolveHostname resolves a hostname to node info via the daemon.
 func (d *Driver) ResolveHostname(hostname string) (map[string]interface{}, error) {
 	msg := make([]byte, 1+len(hostname))

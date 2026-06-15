@@ -53,6 +53,13 @@ const (
 	cmdRotateKeyOK       byte = 0x26
 	cmdBroadcast         byte = 0x29
 	cmdBroadcastOK       byte = 0x2A
+	// cmdPreferDirect asks the daemon to drop the existing tunnel to a
+	// peer (and any cached endpoint / sticky relay flag) and re-resolve
+	// + redial fresh — preferring a direct UDP path. Useful when a peer
+	// got stuck on the beacon relay after an unlucky punch and stream
+	// traffic (send-file) is failing while small messages (ping) work.
+	cmdPreferDirect   byte = 0x2D
+	cmdPreferDirectOK byte = 0x2E
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)
@@ -184,7 +191,8 @@ func (c *ipcClient) readLoop() {
 		case cmdBindOK, cmdDialOK, cmdError, cmdInfoOK, cmdHandshakeOK,
 			cmdResolveHostnameOK, cmdSetHostnameOK, cmdSetVisibilityOK,
 			cmdDeregisterOK, cmdSetTagsOK, cmdSetWebhookOK, cmdNetworkOK,
-			cmdHealthOK, cmdManagedOK, cmdRotateKeyOK, cmdBroadcastOK:
+			cmdHealthOK, cmdManagedOK, cmdRotateKeyOK, cmdBroadcastOK,
+			cmdPreferDirectOK:
 			// Known response cmds: route to pending for the in-flight sendAndWait.
 			select {
 			case c.pending <- &pendingResponse{cmd: cmd, payload: append([]byte(nil), payload...)}:
