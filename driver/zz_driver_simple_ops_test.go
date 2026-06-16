@@ -3,6 +3,7 @@
 package driver
 
 import (
+	"encoding/binary"
 	"testing"
 )
 
@@ -102,6 +103,55 @@ func TestDriverWaitForTrust(t *testing.T) {
 	}
 	if result == nil {
 		t.Errorf("result is nil")
+	}
+}
+
+// TestDriverPreferDirect covers PreferDirect's JSON-RPC roundtrip:
+//   - the request frame is exactly [cmdPreferDirect(0x2D)][big-endian uint32 nodeID] (5 bytes),
+//   - the cmdPreferDirectOK (0x2E) reply is routed/accepted by readLoop (not dropped) —
+//     proven by the happy path returning a non-nil result and nil error, which only
+//     happens if the OK frame reaches the in-flight sendAndWait via c.pending,
+//   - the daemon's returned routing state is unmarshalled and surfaced.
+func TestDriverPreferDirect(t *testing.T) {
+	t.Parallel()
+	d := newFakeDaemon(t)
+	defer d.close()
+
+	const nodeID uint32 = 0xDEADBEEF
+
+	d.onCmd(cmdPreferDirect, func(frame []byte) [][]byte {
+		// Frame is [cmd][payload]; assert the exact 5-byte wire shape.
+		if len(frame) != 5 {
+			t.Errorf("PreferDirect frame len = %d, want 5", len(frame))
+			return [][]byte{{cmdError, 0, 0, 'l', 'e', 'n'}}
+		}
+		if frame[0] != cmdPreferDirect {
+			t.Errorf("PreferDirect opcode = 0x%02X, want 0x%02X", frame[0], cmdPreferDirect)
+		}
+		if got := binary.BigEndian.Uint32(frame[1:5]); got != nodeID {
+			t.Errorf("PreferDirect nodeID = 0x%08X, want 0x%08X", got, nodeID)
+		}
+		body := []byte(`{"node_id":3735928559,"relay_active":false,"pinned":false,"real_addr":"1.2.3.4:9000"}`)
+		return [][]byte{append([]byte{cmdPreferDirectOK}, body...)}
+	})
+
+	drv, err := Connect(d.path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer drv.Close()
+
+	result, err := drv.PreferDirect(nodeID)
+	if err != nil {
+		t.Fatalf("PreferDirect: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("PreferDirect result is nil")
+	}
+	// The cmdPreferDirectOK payload must have been routed (not dropped) and
+	// unmarshalled — check a field round-tripped.
+	if ra, ok := result["relay_active"].(bool); !ok || ra {
+		t.Errorf("relay_active = %v (ok=%v), want false", result["relay_active"], ok)
 	}
 }
 
