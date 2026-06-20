@@ -85,6 +85,15 @@ func TestNilClient_AllMethodsReturnError(t *testing.T) {
 	callMap("RotateKey", func() (map[string]interface{}, error) {
 		return c.RotateKey(1, "sig", "newkey")
 	})
+	callMap("SubmitBadge", func() (map[string]interface{}, error) {
+		return c.SubmitBadge(1, "badge", "bsig", "sig")
+	})
+	callMap("EnrollRecovery", func() (map[string]interface{}, error) {
+		return c.EnrollRecovery(1, "enr", "esig", "sig")
+	})
+	callMap("RecoverIdentity", func() (map[string]interface{}, error) {
+		return c.RecoverIdentity(1, "rec", "rsig", "newkey")
+	})
 	callMap("Lookup", func() (map[string]interface{}, error) { return c.Lookup(1) })
 	callMap("Resolve", func() (map[string]interface{}, error) { return c.Resolve(1, 2) })
 	callMap("ReportTrust", func() (map[string]interface{}, error) { return c.ReportTrust(1, 2) })

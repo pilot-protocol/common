@@ -618,6 +618,45 @@ func (c *Client) RotateKey(nodeID uint32, signatureB64, newPubKeyB64 string) (ma
 	return c.Send(msg)
 }
 
+// SubmitBadge attaches a verified-address badge to a node. signatureB64 is a
+// signature by the node's CURRENT key over "submit_badge:<node_id>:<badge>",
+// proving ownership; the registry also verifies the badge offline against the
+// pinned issuer key.
+func (c *Client) SubmitBadge(nodeID uint32, badge, badgeSig, signatureB64 string) (map[string]interface{}, error) {
+	return c.Send(map[string]interface{}{
+		"type":      "submit_badge",
+		"node_id":   nodeID,
+		"badge":     badge,
+		"badge_sig": badgeSig,
+		"signature": signatureB64,
+	})
+}
+
+// EnrollRecovery records a node's opaque recovery commitment. signatureB64 is
+// a signature by the node's CURRENT key over
+// "enroll_recovery:<node_id>:<commitment>".
+func (c *Client) EnrollRecovery(nodeID uint32, enrollment, enrollmentSig, signatureB64 string) (map[string]interface{}, error) {
+	return c.Send(map[string]interface{}{
+		"type":           "enroll_recovery",
+		"node_id":        nodeID,
+		"enrollment":     enrollment,
+		"enrollment_sig": enrollmentSig,
+		"signature":      signatureB64,
+	})
+}
+
+// RecoverIdentity force-rotates a node's key to newPubKeyB64 using a
+// cold-key-signed recovery authorization — no current key required.
+func (c *Client) RecoverIdentity(nodeID uint32, recovery, recoverySig, newPubKeyB64 string) (map[string]interface{}, error) {
+	return c.Send(map[string]interface{}{
+		"type":           "recover_identity",
+		"node_id":        nodeID,
+		"recovery":       recovery,
+		"recovery_sig":   recoverySig,
+		"new_public_key": newPubKeyB64,
+	})
+}
+
 func (c *Client) Lookup(nodeID uint32) (map[string]interface{}, error) {
 	return c.Send(map[string]interface{}{
 		"type":    "lookup",
