@@ -55,11 +55,14 @@ const (
 // credentials: ship the new key alongside the old, issue under the new
 // kid, retire the old once its credentials expire.
 //
-// Overridable at build time (the compiled-in default is a placeholder —
-// it MUST be replaced at release):
+// The compiled-in default pins the production badge issuer key (kid bdg-v1),
+// whose private half lives only in Cloud KMS (EC_SIGN_ED25519, key ring
+// pilot-badges/badge-issuer). The public key is non-secret by design — it is
+// meant to be embedded in every verifier. Overridable at build time for
+// rotation:
 //
-//	-ldflags "-X github.com/pilot-protocol/common/badgeverify.keyringB64=v1=<b64>"
-var keyringB64 = "v1=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+//	-ldflags "-X github.com/pilot-protocol/common/badgeverify.keyringB64=bdg-v2=<b64>"
+var keyringB64 = "bdg-v1=Y2jjSAS+J6LVXAguY4P51vMGhHl7qgy5qBJZGS0Cmms="
 
 // recoveryKeyringB64 is a SEPARATE pinned keyring holding only the COLD
 // recovery-authority keys, which sign nothing but recovery authorizations.

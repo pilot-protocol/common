@@ -105,15 +105,61 @@ func TestUnknownKidFailsClosed(t *testing.T) {
 	}
 }
 
-func TestPlaceholderKeyFailsClosed(t *testing.T) {
-	// With the compiled-in all-zeros placeholder, verification must fail
-	// CLOSED with ErrNoKey — never attempting an ed25519.Verify against the
-	// low-order zero key. Guards against shipping without the -ldflags
-	// issuer-key override.
+func TestIssuerKeyPinned(t *testing.T) {
+	// The production badge issuer key (kid bdg-v1) is pinned in the compiled-in
+	// keyring. Confirm it is present and is NOT the all-zero placeholder, and
+	// that a badge bearing kid bdg-v1 but signed by a FOREIGN key is rejected
+	// with ErrBadSignature — i.e. a real ed25519.Verify runs against the pinned
+	// key, rather than failing closed with ErrNoKey (which would mean the key
+	// was never pinned).
+	pk := keyFor("bdg-v1")
+	if pk == nil {
+		t.Fatal("bdg-v1 issuer key is not pinned in the compiled-in keyring")
+	}
+	if isAllZero(pk) {
+		t.Fatal("bdg-v1 issuer key is still the all-zero placeholder")
+	}
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	s, sig := sign(t, priv, validBadge())
-	if _, err := Verify(s, sig); !errors.Is(err, ErrNoKey) {
-		t.Fatalf("placeholder keyring must fail closed with ErrNoKey, got %v", err)
+	b := validBadge()
+	b.Kid = "bdg-v1"
+	s, sig := sign(t, priv, b)
+	if _, err := Verify(s, sig); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("foreign-signed badge under the pinned kid must fail with ErrBadSignature, got %v", err)
+	}
+}
+
+func TestPinnedIssuerGoldenVector(t *testing.T) {
+	// A real badge signed by the production KMS issuer key (bdg-v1) must verify
+	// against the pinned public key. This vector was produced with
+	// `gcloud kms asymmetric-sign` (key ring pilot-badges/badge-issuer) over the
+	// canonical badge below; baking it in locks down that genuine KMS signatures
+	// validate offline — with no KMS access required at test time.
+	const badge = "pilotbadge:v1:12345:github:1781827200:0:bdg-v1:"
+	const sig = "Gt7fdGmEYppTEFGSRIGsjb79ol6vffH1kinMgbis3ok6uCOPKyVSuDivgiCPlqNod9/X7CK9FiCLS+5YlFVVBg=="
+
+	b, err := Verify(badge, sig)
+	if err != nil {
+		t.Fatalf("KMS-signed golden badge must verify against the pinned key: %v", err)
+	}
+	if b.NodeID != 12345 || b.Provider != "github" || b.Kid != "bdg-v1" {
+		t.Fatalf("unexpected parsed badge: %+v", b)
+	}
+	// Node-binding rule: the same vector binds to node 12345 and no other.
+	if _, err := VerifyForNode(badge, sig, 12345); err != nil {
+		t.Errorf("VerifyForNode(12345) should pass: %v", err)
+	}
+	if _, err := VerifyForNode(badge, sig, 99999); !errors.Is(err, ErrNodeMismatch) {
+		t.Errorf("VerifyForNode(99999) must fail ErrNodeMismatch, got %v", err)
+	}
+}
+
+func TestRecoveryKeyStillPlaceholderFailsClosed(t *testing.T) {
+	// The COLD recovery keyring stays an all-zero placeholder until the sole
+	// custodian pins rec-v1. Until then every recovery authorization must fail
+	// closed with ErrNoKey — pinning the badge issuer key above must NOT have
+	// accidentally enabled recovery.
+	if pk := recoveryKeyFor("rec-v1"); pk != nil && !isAllZero(pk) {
+		t.Fatal("recovery keyring is no longer a placeholder — rec-v1 must stay unpinned")
 	}
 }
 
