@@ -68,11 +68,13 @@ var keyringB64 = "bdg-v1=Y2jjSAS+J6LVXAguY4P51vMGhHl7qgy5qBJZGS0Cmms="
 // recovery-authority keys, which sign nothing but recovery authorizations.
 // Recovery statements verify against this keyring exclusively — so even a
 // total compromise of the online badge keyring above cannot forge a
-// recovery (and thus cannot seize any address). Keep the matching private
-// key offline/air-gapped.
+// recovery (and thus cannot seize any address). The default pins rec-v1,
+// whose private half lives only in Cloud KMS (key ring pilot-recovery /
+// recovery-authority, Ed25519, non-exportable) with signing locked to the
+// sole custodian. Overridable at build time for rotation:
 //
-//	-ldflags "-X github.com/pilot-protocol/common/badgeverify.recoveryKeyringB64=rec-v1=<b64>"
-var recoveryKeyringB64 = "rec-v1=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+//	-ldflags "-X github.com/pilot-protocol/common/badgeverify.recoveryKeyringB64=rec-v2=<b64>"
+var recoveryKeyringB64 = "rec-v1=EGQ7F/NGzCIPekBo1jx+eUQUfOBFQU/hyhiZd3xumTY="
 
 var (
 	// ErrNoKey is returned when no pinned key matches the badge's kid (or

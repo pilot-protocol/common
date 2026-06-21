@@ -153,13 +153,44 @@ func TestPinnedIssuerGoldenVector(t *testing.T) {
 	}
 }
 
-func TestRecoveryKeyStillPlaceholderFailsClosed(t *testing.T) {
-	// The COLD recovery keyring stays an all-zero placeholder until the sole
-	// custodian pins rec-v1. Until then every recovery authorization must fail
-	// closed with ErrNoKey — pinning the badge issuer key above must NOT have
-	// accidentally enabled recovery.
-	if pk := recoveryKeyFor("rec-v1"); pk != nil && !isAllZero(pk) {
-		t.Fatal("recovery keyring is no longer a placeholder — rec-v1 must stay unpinned")
+func TestRecoveryKeyPinned(t *testing.T) {
+	// The cold recovery-authority key (rec-v1) is pinned in the SEPARATE
+	// recovery keyring. Confirm it is present, non-zero, and DISTINCT from the
+	// badge issuer key (the two-key separation: a badge-key compromise must not
+	// forge a recovery).
+	pk := recoveryKeyFor("rec-v1")
+	if pk == nil {
+		t.Fatal("rec-v1 recovery key is not pinned in the recovery keyring")
+	}
+	if isAllZero(pk) {
+		t.Fatal("rec-v1 recovery key is still the all-zero placeholder")
+	}
+	if bk := keyFor("bdg-v1"); bk != nil && pk.Equal(bk) {
+		t.Fatal("recovery key must NOT equal the badge issuer key (separation broken)")
+	}
+}
+
+func TestPinnedRecoveryGoldenVector(t *testing.T) {
+	// A real recovery authorization signed by the KMS recovery-authority key
+	// must verify against the pinned rec-v1 key. This vector was produced with
+	// `gcloud kms asymmetric-sign` (key ring pilot-recovery/recovery-authority)
+	// over the canonical recovery statement below (exp far in the future so the
+	// vector never expires). Locks down that genuine KMS recovery signatures
+	// validate offline, no KMS access at test time.
+	const stmt = "pilotrecover:v1:12345:bmV3cHVi:Y29tbWl0:9999999999:nonce123:rec-v1"
+	const sig = "BIjylWm38saYiXT+KIVf3Ye4WMSFb5y8UfhFo5FyCnvJLdFMEg05JmbXR0CikvT0BzYDoICaz1kvIEWg0KPGCg=="
+
+	rec, err := VerifyRecovery(stmt, sig)
+	if err != nil {
+		t.Fatalf("KMS-signed recovery vector must verify against pinned rec-v1: %v", err)
+	}
+	if rec.NodeID != 12345 || rec.Kid != "rec-v1" || rec.Exp != 9999999999 {
+		t.Fatalf("unexpected parsed recovery: %+v", rec)
+	}
+	// A badge (online-key) signature must NOT satisfy recovery verification —
+	// recovery checks the cold keyring exclusively.
+	if _, err := VerifyRecovery(stmt, "AAAA"); err == nil {
+		t.Error("a non-recovery-key signature must fail recovery verification")
 	}
 }
 
