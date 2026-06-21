@@ -229,3 +229,22 @@ func TestColonRejectedInFields(t *testing.T) {
 		t.Fatalf("colon in subject must be rejected, got %v", err)
 	}
 }
+
+// TestRejectsNonCanonicalBadge pins the malleability guard: a badge whose
+// encoding does not round-trip through Canonical (e.g. a leading-zero node_id)
+// is rejected as malformed BEFORE the signature is even checked.
+func TestRejectsNonCanonicalBadge(t *testing.T) {
+	priv := newIssuer(t, "v1")
+	// validBadge() fields, but node_id 109517 written as "0109517".
+	nonCanon := "pilotbadge:v1:0109517:github:1700000000:0:v1:"
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(nonCanon)))
+	if _, err := Verify(nonCanon, sig); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("non-canonical badge must reject with ErrMalformed, got %v", err)
+	}
+	// The canonical form of the same badge still verifies.
+	canon, _ := Canonical(validBadge())
+	csig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(canon)))
+	if _, err := Verify(canon, csig); err != nil {
+		t.Fatalf("canonical badge must still verify: %v", err)
+	}
+}
