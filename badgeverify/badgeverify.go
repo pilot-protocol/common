@@ -246,6 +246,13 @@ func verifyAt(badgeStr, sigB64 string, now time.Time) (Badge, error) {
 	if err != nil {
 		return Badge{}, err
 	}
+	// Reject non-canonical encodings (leading zeros, '+' signs, etc.). The
+	// issuer always signs the canonical form, so a string that does not
+	// round-trip is malformed — this forecloses any byte-string-vs-parsed-
+	// fields malleability for downstream consumers.
+	if canon, cerr := Canonical(b); cerr != nil || canon != badgeStr {
+		return b, fmt.Errorf("%w: non-canonical encoding", ErrMalformed)
+	}
 	if err := verifyDetached(badgeStr, sigB64, b.Kid); err != nil {
 		return b, err
 	}
