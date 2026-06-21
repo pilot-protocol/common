@@ -361,6 +361,33 @@ func (d *Driver) RotateKey() (map[string]interface{}, error) {
 	return d.jsonRPC([]byte{cmdRotateKey}, cmdRotateKeyOK, "rotate_key")
 }
 
+// SubmitBadge attaches a verified-address badge to this node's registry
+// entry. badge and badgeSig are produced out-of-band by the verifier
+// sidecar; the daemon signs proof of the current key over the badge before
+// forwarding to the registry, which also verifies the badge offline against
+// the pinned issuer key. Verification is optional — nodes without a badge
+// keep working unchanged.
+func (d *Driver) SubmitBadge(badge, badgeSig string) (map[string]interface{}, error) {
+	data, _ := json.Marshal(map[string]string{"badge": badge, "badge_sig": badgeSig})
+	msg := make([]byte, 1+len(data))
+	msg[0] = cmdSubmitBadge
+	copy(msg[1:], data)
+	return d.jsonRPC(msg, cmdSubmitBadgeOK, "submit_badge")
+}
+
+// EnrollRecovery records this node's opaque recovery commitment so the
+// address can later be recovered if the current key is lost. enrollment and
+// enrollmentSig come from the verifier sidecar; the daemon signs proof of the
+// current key over the commitment before forwarding to the registry. The
+// raw external identity never leaves the verifier — only the commitment.
+func (d *Driver) EnrollRecovery(enrollment, enrollmentSig string) (map[string]interface{}, error) {
+	data, _ := json.Marshal(map[string]string{"enrollment": enrollment, "enrollment_sig": enrollmentSig})
+	msg := make([]byte, 1+len(data))
+	msg[0] = cmdEnrollRecovery
+	copy(msg[1:], data)
+	return d.jsonRPC(msg, cmdEnrollRecoveryOK, "enroll_recovery")
+}
+
 // Disconnect closes a connection by ID. Used by administrative tools.
 // Fire-and-forget: the daemon always responds CmdCloseOK regardless of
 // whether the connID exists, so there is no error to propagate. Using

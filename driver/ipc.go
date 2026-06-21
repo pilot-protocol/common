@@ -60,6 +60,15 @@ const (
 	// traffic (send-file) is failing while small messages (ping) work.
 	cmdPreferDirect   byte = 0x2D
 	cmdPreferDirectOK byte = 0x2E
+	// cmdSubmitBadge attaches a verified-address badge to this node. The
+	// daemon adds a signature by the current key proving ownership before
+	// forwarding to the registry. cmdEnrollRecovery records the node's
+	// opaque recovery commitment the same way. Both are optional features:
+	// older daemons without these handlers reply cmdError.
+	cmdSubmitBadge      byte = 0x2F
+	cmdSubmitBadgeOK    byte = 0x30
+	cmdEnrollRecovery   byte = 0x31
+	cmdEnrollRecoveryOK byte = 0x32
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)
@@ -192,7 +201,7 @@ func (c *ipcClient) readLoop() {
 			cmdResolveHostnameOK, cmdSetHostnameOK, cmdSetVisibilityOK,
 			cmdDeregisterOK, cmdSetTagsOK, cmdSetWebhookOK, cmdNetworkOK,
 			cmdHealthOK, cmdManagedOK, cmdRotateKeyOK, cmdBroadcastOK,
-			cmdPreferDirectOK:
+			cmdPreferDirectOK, cmdSubmitBadgeOK, cmdEnrollRecoveryOK:
 			// Known response cmds: route to pending for the in-flight sendAndWait.
 			select {
 			case c.pending <- &pendingResponse{cmd: cmd, payload: append([]byte(nil), payload...)}:
