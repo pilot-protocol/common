@@ -85,4 +85,14 @@ const (
 	BeaconMsgRelay         byte = 0x05
 	BeaconMsgRelayDeliver  byte = 0x06
 	BeaconMsgSync          byte = 0x07 // gossip: beacon-to-beacon node list exchange
+
+	// Extended discovery for endpoints that cannot infer a relayed frame's
+	// destination implicitly. A standard endpoint owns a single node id, so
+	// BeaconMsgRelayDeliver (0x06 = [0x06][srcNodeID(4)][frame]) carries no
+	// destination. An endpoint registered via BeaconMsgDiscoverEx (same wire
+	// shape as BeaconMsgDiscover: [0x08][nodeID(4)]) instead receives
+	// BeaconMsgRelayDeliverDest = [0x09][srcNodeID(4)][destNodeID(4)][frame...].
+	// Opt-in: endpoints registered with 0x01 keep receiving 0x06.
+	BeaconMsgDiscoverEx       byte = 0x08
+	BeaconMsgRelayDeliverDest byte = 0x09
 )
