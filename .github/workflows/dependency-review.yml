@@ -19,6 +19,6 @@ jobs:
       # step reports real findings. Flip this to a hard gate after enabling.
       - name: Dependency Review
         continue-on-error: true
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: high
