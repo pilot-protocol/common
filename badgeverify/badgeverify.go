@@ -112,6 +112,60 @@ func noColon(field, v string) error {
 	return nil
 }
 
+// isCanonicalDecimal reports whether s is the UNIQUE base-10 spelling of a
+// non-negative integer: no sign, no leading zeros (except the literal "0"),
+// no whitespace, no "+1"/"01"/" 1" malleability. strconv.ParseUint/ParseInt
+// accept several spellings of the same number; because the signed bytes ARE
+// the wire string, two spellings of one logical value would be two distinct
+// signable strings (a malleability hazard). Requiring the canonical spelling
+// makes the parsers themselves reject the alternates — defense in depth under
+// the verify-layer round-trip check — and closes the same gap for the
+// enrollment and recovery parsers, which have no verify-layer guard.
+func isCanonicalDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s == "0" {
+		return true
+	}
+	if s[0] == '0' { // leading zero on a multi-digit number
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' { // rejects '+', '-', whitespace, any non-digit
+			return false
+		}
+	}
+	return true
+}
+
+// parseCanonicalUint32 parses a node_id, rejecting any non-canonical
+// spelling before delegating to strconv for the range check.
+func parseCanonicalUint32(field, s string) (uint32, error) {
+	if !isCanonicalDecimal(s) {
+		return 0, fmt.Errorf("%w: %s is not canonical decimal: %q", ErrMalformed, field, s)
+	}
+	v, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %s: %v", ErrMalformed, field, err)
+	}
+	return uint32(v), nil
+}
+
+// parseCanonicalInt64 parses a non-negative timestamp/exp. All numeric
+// fields on the wire are non-negative (unix seconds, 0 = none), so a
+// leading '-' is itself non-canonical and rejected.
+func parseCanonicalInt64(field, s string) (int64, error) {
+	if !isCanonicalDecimal(s) {
+		return 0, fmt.Errorf("%w: %s is not canonical decimal: %q", ErrMalformed, field, s)
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %s: %v", ErrMalformed, field, err)
+	}
+	return v, nil
+}
+
 // Canonical returns the exact byte string that is signed and that travels
 // on the wire as the "badge" field. The issuer signs these bytes; the
 // verifier checks the signature over the bytes it received and only then
@@ -149,17 +203,17 @@ func Parse(s string) (Badge, error) {
 	if parts[1] != Version {
 		return Badge{}, fmt.Errorf("%w: unsupported version %q", ErrMalformed, parts[1])
 	}
-	nodeID, err := strconv.ParseUint(parts[2], 10, 32)
+	nodeID, err := parseCanonicalUint32("node_id", parts[2])
 	if err != nil {
-		return Badge{}, fmt.Errorf("%w: node_id: %v", ErrMalformed, err)
+		return Badge{}, err
 	}
-	verifiedAt, err := strconv.ParseInt(parts[4], 10, 64)
+	verifiedAt, err := parseCanonicalInt64("verified_at", parts[4])
 	if err != nil {
-		return Badge{}, fmt.Errorf("%w: verified_at: %v", ErrMalformed, err)
+		return Badge{}, err
 	}
-	exp, err := strconv.ParseInt(parts[5], 10, 64)
+	exp, err := parseCanonicalInt64("exp", parts[5])
 	if err != nil {
-		return Badge{}, fmt.Errorf("%w: exp: %v", ErrMalformed, err)
+		return Badge{}, err
 	}
 	if parts[3] == "" {
 		return Badge{}, fmt.Errorf("%w: provider is required", ErrMalformed)
@@ -168,7 +222,7 @@ func Parse(s string) (Badge, error) {
 		return Badge{}, fmt.Errorf("%w: kid is required", ErrMalformed)
 	}
 	return Badge{
-		NodeID:     uint32(nodeID),
+		NodeID:     nodeID,
 		Provider:   parts[3],
 		VerifiedAt: verifiedAt,
 		Exp:        exp,

@@ -4,7 +4,6 @@ package badgeverify
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -99,19 +98,19 @@ func ParseEnrollment(s string) (Enrollment, error) {
 	if parts[1] != Version {
 		return Enrollment{}, fmt.Errorf("%w: unsupported version %q", ErrMalformed, parts[1])
 	}
-	nodeID, err := strconv.ParseUint(parts[2], 10, 32)
+	nodeID, err := parseCanonicalUint32("node_id", parts[2])
 	if err != nil {
-		return Enrollment{}, fmt.Errorf("%w: node_id: %v", ErrMalformed, err)
+		return Enrollment{}, err
 	}
-	issuedAt, err := strconv.ParseInt(parts[5], 10, 64)
+	issuedAt, err := parseCanonicalInt64("issued_at", parts[5])
 	if err != nil {
-		return Enrollment{}, fmt.Errorf("%w: issued_at: %v", ErrMalformed, err)
+		return Enrollment{}, err
 	}
 	if parts[3] == "" || parts[4] == "" || parts[6] == "" {
 		return Enrollment{}, fmt.Errorf("%w: enrollment has empty required field", ErrMalformed)
 	}
 	return Enrollment{
-		NodeID: uint32(nodeID), Provider: parts[3], Commitment: parts[4],
+		NodeID: nodeID, Provider: parts[3], Commitment: parts[4],
 		IssuedAt: issuedAt, Kid: parts[6],
 	}, nil
 }
@@ -129,19 +128,25 @@ func ParseRecovery(s string) (Recovery, error) {
 	if parts[1] != Version {
 		return Recovery{}, fmt.Errorf("%w: unsupported version %q", ErrMalformed, parts[1])
 	}
-	nodeID, err := strconv.ParseUint(parts[2], 10, 32)
+	nodeID, err := parseCanonicalUint32("node_id", parts[2])
 	if err != nil {
-		return Recovery{}, fmt.Errorf("%w: node_id: %v", ErrMalformed, err)
+		return Recovery{}, err
 	}
-	exp, err := strconv.ParseInt(parts[5], 10, 64)
+	exp, err := parseCanonicalInt64("exp", parts[5])
 	if err != nil {
-		return Recovery{}, fmt.Errorf("%w: exp: %v", ErrMalformed, err)
+		return Recovery{}, err
+	}
+	// A recovery with exp<=0 is never valid (CanonicalRecovery refuses to
+	// emit one); reject it at the parse boundary so the round-trip is exact
+	// and an exp=0 takeover token cannot even be represented.
+	if exp <= 0 {
+		return Recovery{}, fmt.Errorf("%w: recovery exp must be set (non-zero)", ErrMalformed)
 	}
 	if parts[3] == "" || parts[4] == "" || parts[6] == "" || parts[7] == "" {
 		return Recovery{}, fmt.Errorf("%w: recovery has empty required field", ErrMalformed)
 	}
 	return Recovery{
-		NodeID: uint32(nodeID), NewPubKey: parts[3], Commitment: parts[4],
+		NodeID: nodeID, NewPubKey: parts[3], Commitment: parts[4],
 		Exp: exp, Nonce: parts[6], Kid: parts[7],
 	}, nil
 }
