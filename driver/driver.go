@@ -27,6 +27,14 @@ func DefaultSocketPath() string {
 	return "/tmp/pilot.sock"
 }
 
+// defaultDialTimeout bounds DialAddr / Listen / Broadcast so a wedged or
+// non-responsive daemon can't block the caller forever. The daemon resolves
+// + dials within this window in the normal case (direct punch or relay
+// fallback both complete well under it); callers needing a tighter bound use
+// DialAddrTimeout. Operations that legitimately block in the daemon
+// (WaitForTrust) deliberately keep the unbounded sendAndWait path.
+const defaultDialTimeout = 30 * time.Second
+
 // Handshake sub-commands (must match daemon SubHandshake* constants)
 const (
 	subHandshakeSend    byte = 0x01
@@ -83,32 +91,11 @@ func (d *Driver) Dial(addr string) (*Conn, error) {
 	return d.DialAddr(sa.Addr, sa.Port)
 }
 
-// DialAddr opens a stream connection to a remote Addr + port.
+// DialAddr opens a stream connection to a remote Addr + port. It applies
+// defaultDialTimeout so a non-responsive daemon cannot block the caller
+// indefinitely; use DialAddrTimeout to supply an explicit bound.
 func (d *Driver) DialAddr(dst protocol.Addr, port uint16) (*Conn, error) {
-	msg := make([]byte, 1+protocol.AddrSize+2)
-	msg[0] = cmdDial
-	dst.MarshalTo(msg, 1)
-	binary.BigEndian.PutUint16(msg[1+protocol.AddrSize:], port)
-
-	resp, err := d.ipc.sendAndWait(msg, cmdDialOK)
-	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
-	}
-
-	if len(resp) < 4 {
-		return nil, fmt.Errorf("invalid dial response")
-	}
-
-	connID := binary.BigEndian.Uint32(resp[0:4])
-	recvCh := d.ipc.registerRecvCh(connID)
-
-	return &Conn{
-		id:         connID,
-		remoteAddr: protocol.SocketAddr{Addr: dst, Port: port},
-		ipc:        d.ipc,
-		recvCh:     recvCh,
-		deadlineCh: make(chan struct{}),
-	}, nil
+	return d.DialAddrTimeout(dst, port, defaultDialTimeout)
 }
 
 // DialAddrTimeout opens a stream connection with a client-side timeout.
@@ -146,7 +133,7 @@ func (d *Driver) Listen(port uint16) (*Listener, error) {
 	msg[0] = cmdBind
 	binary.BigEndian.PutUint16(msg[1:3], port)
 
-	resp, err := d.ipc.sendAndWait(msg, cmdBindOK)
+	resp, err := d.ipc.sendAndWaitTimeout(msg, cmdBindOK, defaultDialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
 	}
@@ -167,6 +154,13 @@ func (d *Driver) Listen(port uint16) (*Listener, error) {
 // SendTo sends an unreliable unicast datagram to the given address:port.
 // Broadcast addresses (Node=0xFFFFFFFF) are not accepted on this path; use
 // Broadcast, which requires the daemon's admin token.
+//
+// Send semantics: this is fire-and-forget. A nil return means only that the
+// frame was successfully enqueued to the local daemon over IPC — it does NOT
+// indicate the datagram was transmitted on the wire, routed, or delivered to
+// the peer. Datagrams are unreliable; there is no acknowledgement. The only
+// errors reported are local IPC failures (empty/oversized frame, socket
+// write error).
 func (d *Driver) SendTo(dst protocol.Addr, port uint16, data []byte) error {
 	if dst.IsBroadcast() {
 		return fmt.Errorf("broadcast address requires admin token: use Driver.Broadcast")
@@ -192,7 +186,7 @@ func (d *Driver) Broadcast(netID uint16, port uint16, data []byte, adminToken st
 	binary.BigEndian.PutUint16(msg[5:7], uint16(len(tokenBytes)))
 	copy(msg[7:7+len(tokenBytes)], tokenBytes)
 	copy(msg[7+len(tokenBytes):], data)
-	if _, err := d.ipc.sendAndWait(msg, cmdBroadcastOK); err != nil {
+	if _, err := d.ipc.sendAndWaitTimeout(msg, cmdBroadcastOK, defaultDialTimeout); err != nil {
 		return err
 	}
 	return nil
