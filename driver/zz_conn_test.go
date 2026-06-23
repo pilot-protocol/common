@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pilot-protocol/common/ipcutil"
 	"github.com/pilot-protocol/common/protocol"
 )
 
@@ -171,7 +172,7 @@ func TestSetReadDeadlineUnblocksReader(t *testing.T) {
 	}
 }
 
-func TestSetDeadlineDelegatesToRead(t *testing.T) {
+func TestSetDeadlineSetsReadAndWrite(t *testing.T) {
 	t.Parallel()
 	c := &Conn{
 		recvCh:     make(chan []byte),
@@ -184,14 +185,56 @@ func TestSetDeadlineDelegatesToRead(t *testing.T) {
 	if !c.readDeadline.Equal(dl) {
 		t.Errorf("readDeadline = %v, want %v", c.readDeadline, dl)
 	}
+	if !c.writeDeadline.Equal(dl) {
+		t.Errorf("writeDeadline = %v, want %v", c.writeDeadline, dl)
+	}
 }
 
-func TestSetWriteDeadlineNoop(t *testing.T) {
+// TestSetWriteDeadlinePastBlocksWrite verifies SetWriteDeadline is no longer
+// a no-op: a deadline already in the past makes Write fail with
+// os.ErrDeadlineExceeded instead of silently succeeding.
+func TestSetWriteDeadlinePastBlocksWrite(t *testing.T) {
 	t.Parallel()
-	c := &Conn{}
-	if err := c.SetWriteDeadline(time.Now()); err != nil {
-		t.Errorf("expected nil, got %v", err)
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	defer serverSide.Close()
+
+	ipc := &ipcClient{
+		conn:      clientSide,
+		waitSem:   make(chan struct{}, 1),
+		recvChs:   make(map[uint32]chan []byte),
+		pendRecv:  make(map[uint32][][]byte),
+		acceptChs: make(map[uint16]chan []byte),
+		dgCh:      make(chan *Datagram, 1),
+		doneCh:    make(chan struct{}),
 	}
+	c := &Conn{id: 1, ipc: ipc, deadlineCh: make(chan struct{})}
+
+	if err := c.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	n, err := c.Write([]byte("data"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write err = %v, want os.ErrDeadlineExceeded", err)
+	}
+	if n != 0 {
+		t.Errorf("Write n = %d, want 0", n)
+	}
+
+	// Clearing the deadline (zero time) restores normal writes.
+	if err := c.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear SetWriteDeadline: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = serverSide.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = ipcutil.Read(serverSide)
+	}()
+	if _, err := c.Write([]byte("ok")); err != nil {
+		t.Fatalf("Write after clearing deadline: %v", err)
+	}
+	<-done
 }
 
 func TestConnAddrs(t *testing.T) {
