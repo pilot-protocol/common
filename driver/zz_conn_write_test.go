@@ -25,7 +25,6 @@ func TestConnWriteChunksLargePayload(t *testing.T) {
 	ipc := &ipcClient{
 		conn:      clientSide,
 		waitSem:   make(chan struct{}, 1),
-		pending:   make(chan *pendingResponse, 16),
 		recvChs:   make(map[uint32]chan []byte),
 		pendRecv:  make(map[uint32][][]byte),
 		acceptChs: make(map[uint16]chan []byte),
@@ -123,7 +122,6 @@ func TestConnWriteSinglePayloadNotSplit(t *testing.T) {
 	ipc := &ipcClient{
 		conn:      clientSide,
 		waitSem:   make(chan struct{}, 1),
-		pending:   make(chan *pendingResponse, 16),
 		recvChs:   make(map[uint32]chan []byte),
 		pendRecv:  make(map[uint32][][]byte),
 		acceptChs: make(map[uint16]chan []byte),

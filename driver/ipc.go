@@ -109,6 +109,19 @@ type pendingResponse struct {
 	payload []byte
 }
 
+// ipcWaiter is the per-request reply slot. A waiter is identified by its
+// pointer identity (abandonWaiter clears the active slot only if it is still
+// this exact waiter), so a late reply for an abandoned request is dropped
+// rather than delivered to the next caller. expect is the cmd this request
+// awaits; deliverReply only accepts a frame whose cmd is expect or cmdError,
+// dropping anything else (e.g. a stale reply for a prior request that arrives
+// WHILE this one is in flight) and leaving the waiter armed. ch has capacity
+// 1 so readLoop never blocks delivering a reply.
+type ipcWaiter struct {
+	expect byte
+	ch     chan *pendingResponse
+}
+
 type ipcClient struct {
 	conn net.Conn
 
@@ -121,8 +134,27 @@ type ipcClient struct {
 	// instead of sync.Mutex lets goroutines waiting for the semaphore be
 	// woken on doneCh close, preventing a deadlock when the daemon closes
 	// while many goroutines are queued behind a slow sendAndWait.
-	waitSem chan struct{}         // capacity 1
-	pending chan *pendingResponse // capacity 16; buffers reply frames from readLoop
+	waitSem chan struct{} // capacity 1
+
+	// waiterMu guards the active-waiter slot. The IPC wire protocol has no
+	// request IDs and the daemon dispatches requests concurrently, so a
+	// reply that arrives AFTER its request timed out (or was abandoned)
+	// must NOT be handed to the next caller — doing so mis-correlates a
+	// stale reply with an unrelated request (wrong conn_id / result).
+	//
+	// We mitigate this client-side: every sendAndWait registers a private
+	// reply channel as the active waiter. readLoop delivers a reply only to
+	// the CURRENTLY active waiter (and only when the cmd matches). When a
+	// request times out or is abandoned it clears the active slot, so a
+	// late reply finds no matching waiter and is dropped.
+	//
+	// TODO(PILOT): cross-process ordering correctness ultimately requires
+	// daemon-side request IDs echoed in every reply envelope. That is a
+	// coordinated wire-protocol change (daemon + version bump) and is
+	// deliberately NOT done here; this slot scheme is the client-side
+	// mitigation that keeps a late reply from being mis-delivered.
+	waiterMu     sync.Mutex
+	activeWaiter *ipcWaiter // current in-flight waiter, nil when idle
 
 	recvMu     sync.Mutex
 	recvChs    map[uint32]chan []byte // conn_id → data channel
@@ -147,7 +179,6 @@ func newIPCClient(socketPath string) (*ipcClient, error) {
 	c := &ipcClient{
 		conn:       conn,
 		waitSem:    make(chan struct{}, 1),
-		pending:    make(chan *pendingResponse, 16),
 		recvChs:    make(map[uint32]chan []byte),
 		pendRecv:   make(map[uint32][][]byte),
 		pendAccept: make(map[uint16][][]byte),
@@ -175,10 +206,10 @@ func (c *ipcClient) close() error {
 // Server-pushed frames (cmdRecv, cmdCloseOK, cmdRecvFrom, cmdAccept) are
 // routed by cmd to their per-connection channels. cmdCloseOK is always
 // a server-push (remote FIN); Driver.Disconnect uses send() not
-// sendAndWait() so it never waits for cmdCloseOK in pending.
-// Known response cmds are forwarded to c.pending for sendAndWait.
-// Unknown cmds are silently dropped — they never reach pending, so
-// sendAndWaitTimeout can use a single read without a discard loop.
+// sendAndWait() so it never waits for cmdCloseOK.
+// Known response cmds are delivered to the active sendAndWait waiter (if
+// any). A reply with no active waiter — e.g. one that arrives after its
+// request timed out — is dropped. Unknown cmds are silently dropped.
 func (c *ipcClient) readLoop() {
 	defer c.cleanup()
 	for {
@@ -202,11 +233,12 @@ func (c *ipcClient) readLoop() {
 			cmdDeregisterOK, cmdSetTagsOK, cmdSetWebhookOK, cmdNetworkOK,
 			cmdHealthOK, cmdManagedOK, cmdRotateKeyOK, cmdBroadcastOK,
 			cmdPreferDirectOK, cmdSubmitBadgeOK, cmdEnrollRecoveryOK:
-			// Known response cmds: route to pending for the in-flight sendAndWait.
-			select {
-			case c.pending <- &pendingResponse{cmd: cmd, payload: append([]byte(nil), payload...)}:
-			default:
-			}
+			// Known response cmds: deliver to the active sendAndWait waiter.
+			// If there is no active waiter (the request timed out / was
+			// abandoned, or this is a duplicate), the reply is dropped —
+			// this is the client-side mitigation that prevents a stale
+			// reply from being mis-delivered to a later, unrelated request.
+			c.deliverReply(&pendingResponse{cmd: cmd, payload: append([]byte(nil), payload...)})
 			// default: unknown cmd — silently drop (version mismatch, test injection, etc.)
 		}
 	}
@@ -295,15 +327,12 @@ func (c *ipcClient) dispatchPush(cmd byte, payload []byte) {
 func (c *ipcClient) cleanup() {
 	close(c.doneCh)
 
-	// Drain all buffered responses.
-	for {
-		select {
-		case <-c.pending:
-		default:
-			goto drained
-		}
-	}
-drained:
+	// Clear any active waiter. The in-flight sendAndWaitTimeout selects on
+	// doneCh and will return "daemon disconnected"; dropping the slot here
+	// keeps a racing late reply from being delivered after shutdown.
+	c.waiterMu.Lock()
+	c.activeWaiter = nil
+	c.waiterMu.Unlock()
 
 	// Close all receive channels
 	c.recvMu.Lock()
@@ -348,11 +377,73 @@ func (c *ipcClient) sendAndWait(data []byte, expectCmd byte) ([]byte, error) {
 	return c.sendAndWaitTimeout(data, expectCmd, 0)
 }
 
+// deliverReply hands a reply frame to the active waiter, if any.
+//
+// A frame is delivered only when there is an active waiter AND the frame's
+// cmd is what that waiter expects (or cmdError, which is valid for any
+// request). Anything else is dropped:
+//   - no active waiter: the request already timed out / was abandoned, or
+//     this is a duplicate;
+//   - cmd mismatch: a stale reply for a PRIOR (abandoned) request that
+//     happens to arrive while a different request is in flight — delivering
+//     it would mis-correlate, so it is dropped and the current waiter stays
+//     armed for its own reply.
+//
+// The active waiter's channel has capacity 1 and is single-use, so the send
+// never blocks. When a frame is delivered the slot is cleared so a second
+// (duplicate) frame for the same request is dropped rather than re-delivered.
+func (c *ipcClient) deliverReply(resp *pendingResponse) {
+	c.waiterMu.Lock()
+	w := c.activeWaiter
+	if w == nil || (resp.cmd != w.expect && resp.cmd != cmdError) {
+		c.waiterMu.Unlock()
+		return
+	}
+	c.activeWaiter = nil
+	c.waiterMu.Unlock()
+	w.ch <- resp
+}
+
+// registerWaiter installs a fresh active waiter for a request expecting
+// expect (or cmdError) and returns it. Any previous waiter is replaced;
+// since waitSem serialises callers there is normally at most one, but
+// replacing defensively guarantees a stale slot never lingers.
+func (c *ipcClient) registerWaiter(expect byte) *ipcWaiter {
+	c.waiterMu.Lock()
+	w := &ipcWaiter{expect: expect, ch: make(chan *pendingResponse, 1)}
+	c.activeWaiter = w
+	c.waiterMu.Unlock()
+	return w
+}
+
+// abandonWaiter clears the active slot iff it is still w (pointer identity).
+// Called on timeout/disconnect so a reply that arrives afterwards finds no
+// active waiter and is dropped by deliverReply. If deliverReply already
+// consumed the slot (reply won the race), this is a no-op.
+func (c *ipcClient) abandonWaiter(w *ipcWaiter) {
+	c.waiterMu.Lock()
+	if c.activeWaiter == w {
+		c.activeWaiter = nil
+	}
+	c.waiterMu.Unlock()
+}
+
 // sendAndWaitTimeout serialises at most one request/reply pair at a time
 // via waitSem. timeout=0 means wait forever. The timer is started BEFORE
 // acquiring the semaphore so the timeout applies to queue wait + reply
 // wait combined — without this, goroutines queued behind the semaphore
 // can't time out and pile up indefinitely under high concurrency.
+//
+// Stale-reply safety: the reply is delivered through a private, single-use
+// waiter channel registered immediately before the request is written. On
+// timeout/disconnect the waiter is abandoned, so a late reply for THIS
+// request is dropped by deliverReply instead of being handed to the next
+// caller (which would mis-correlate a stale conn_id / result).
+//
+// TODO(PILOT): full cross-process ordering correctness needs daemon-side
+// request IDs echoed in every reply (coordinated daemon change + version
+// bump). This client-side scheme only guarantees a late reply is not
+// MIS-DELIVERED; it cannot recover the abandoned request's actual result.
 func (c *ipcClient) sendAndWaitTimeout(data []byte, expectCmd byte, timeout time.Duration) ([]byte, error) {
 	if len(data) < 1 {
 		return nil, fmt.Errorf("ipc: empty request")
@@ -378,24 +469,18 @@ func (c *ipcClient) sendAndWaitTimeout(data []byte, expectCmd byte, timeout time
 	}
 	defer func() { <-c.waitSem }()
 
-	// Drain all stale replies buffered before this request was sent.
-	for {
-		select {
-		case <-c.pending:
-		default:
-			goto drained
-		}
-	}
-drained:
+	// Register the private reply slot BEFORE writing so readLoop can only
+	// ever route this request's reply here; mismatched (stale) frames are
+	// dropped by deliverReply and never reach w.ch.
+	w := c.registerWaiter(expectCmd)
 
 	if err := c.writeFrame(data[0], data[1:]); err != nil {
+		c.abandonWaiter(w)
 		return nil, err
 	}
 
-	// Unknown cmds are dropped in readLoop, so the first frame in pending
-	// is always either the expected response or cmdError.
 	select {
-	case resp := <-c.pending:
+	case resp := <-w.ch:
 		if resp.cmd == cmdError {
 			if len(resp.payload) >= 2 {
 				return nil, fmt.Errorf("daemon: %s", string(resp.payload[2:]))
@@ -407,8 +492,12 @@ drained:
 		}
 		return resp.payload, nil
 	case <-c.doneCh:
+		c.abandonWaiter(w)
 		return nil, fmt.Errorf("daemon disconnected")
 	case <-timer:
+		// Abandon the slot so the late reply is dropped, not handed to the
+		// next caller.
+		c.abandonWaiter(w)
 		return nil, fmt.Errorf("dial timeout")
 	}
 }
