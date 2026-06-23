@@ -111,7 +111,7 @@ func TestDriverWaitForTrust(t *testing.T) {
 //   - the request frame is exactly [cmdPreferDirect(0x2D)][big-endian uint32 nodeID] (5 bytes),
 //   - the cmdPreferDirectOK (0x2E) reply is routed/accepted by readLoop (not dropped) —
 //     proven by the happy path returning a non-nil result and nil error, which only
-//     happens if the OK frame reaches the in-flight sendAndWait via c.pending,
+//     happens if the OK frame reaches the in-flight sendAndWait's active waiter,
 //   - the daemon's returned routing state is unmarshalled and surfaced.
 func TestDriverPreferDirect(t *testing.T) {
 	t.Parallel()
