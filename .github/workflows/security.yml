@@ -16,7 +16,7 @@ jobs:
     name: go test -race
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -31,7 +31,7 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -51,7 +51,7 @@ jobs:
     name: gosec (badgeverify)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -67,7 +67,7 @@ jobs:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -79,7 +79,7 @@ jobs:
     name: gitleaks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # The gitleaks GitHub Action requires a paid GITLEAKS_LICENSE secret on
@@ -100,7 +100,7 @@ jobs:
     name: badgeverify fuzz
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
