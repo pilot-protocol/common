@@ -480,6 +480,105 @@ func TestSendAndWaitTimeoutFires(t *testing.T) {
 	}
 }
 
+// TestLateReplyAfterTimeoutNotMisdelivered is the regression test for the
+// stale-IPC-reply mis-correlation bug. The daemon delays the reply to the
+// first request past its timeout; that reply then arrives while a SECOND,
+// unrelated request is in flight. The fix (per-request waiter slots that are
+// abandoned on timeout) must DROP the late reply so the second caller gets
+// its OWN reply, not the stale one — otherwise it would consume a reply with
+// the wrong cmd / payload (in production: wrong conn_id / result).
+//
+// NOTE: cross-process ordering correctness ultimately needs daemon-side
+// request IDs; this only guarantees the late reply is not mis-delivered.
+func TestLateReplyAfterTimeoutNotMisdelivered(t *testing.T) {
+	t.Parallel()
+	d := newFakeDaemon(t)
+	defer d.close()
+	drv, err := Connect(d.path)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer drv.Close()
+
+	// First request (cmdInfo): the daemon never replies promptly. Instead it
+	// schedules a STALE cmdInfoOK to be written to the conn slightly AFTER
+	// the first call has timed out AND a second, unrelated request is in
+	// flight. This reproduces the production race: a timed-out dial's late
+	// reply arriving during a later request.
+	staleArm := make(chan struct{})  // close to release the stale reply
+	staleSent := make(chan struct{}) // closed once the stale reply is written
+	d.onCmd(cmdInfo, func(_ []byte) [][]byte {
+		// acceptLoop already holds d.mu while invoking this handler, so read
+		// d.conn directly — re-locking would deadlock.
+		conn := d.conn
+		go func() {
+			<-staleArm
+			_ = ipcutil.Write(conn, jsonOK(cmdInfoOK, `{"stale":"info-reply"}`))
+			close(staleSent)
+		}()
+		return nil
+	})
+
+	// 1) First call times out (no reply within the window). The buggy code
+	//    left this request's reply destined for a shared buffer; the fix
+	//    abandons the waiter slot here.
+	if _, err := drv.ipc.sendAndWaitTimeout([]byte{cmdInfo}, cmdInfoOK, 40*time.Millisecond); err == nil {
+		t.Fatal("expected first request to time out")
+	}
+
+	// 2) Start a second, unrelated request (cmdHealth) that the daemon does
+	//    NOT answer, so it is parked waiting for a reply. While it waits we
+	//    release the stale cmdInfoOK. Under the bug, that stale frame would
+	//    be handed to this Health waiter (mis-correlation: wrong cmd/payload
+	//    — in production a wrong conn_id). The fix drops it because its cmd
+	//    (cmdInfoOK) doesn't match what Health expects, so Health correctly
+	//    times out instead of consuming the stale reply.
+	type result struct {
+		payload []byte
+		err     error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		p, err := drv.ipc.sendAndWaitTimeout([]byte{cmdHealth}, cmdHealthOK, 400*time.Millisecond)
+		resCh <- result{p, err}
+	}()
+
+	// Give Health time to park in its wait, then release the stale reply so
+	// it lands while Health is in flight.
+	time.Sleep(60 * time.Millisecond)
+	close(staleArm)
+	select {
+	case <-staleSent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale reply was never written — test did not exercise the race")
+	}
+
+	res := <-resCh
+	if res.err == nil {
+		t.Fatalf("Health must NOT succeed by consuming the stale info reply; got payload %q", res.payload)
+	}
+	// The stale reply is cmdInfoOK; if it were mis-delivered, Health would
+	// have returned either that payload or an "unexpected reply" cmd error
+	// rather than its own timeout.
+	if want := "dial timeout"; res.err.Error() != want {
+		t.Fatalf("Health err = %q, want %q (stale reply was mis-delivered)", res.err.Error(), want)
+	}
+
+	// 3) Prove the connection is still healthy: a fresh Health that the
+	//    daemon answers must succeed, confirming the dropped stale frame did
+	//    not poison the waiter slot.
+	d.onCmd(cmdHealth, func(_ []byte) [][]byte {
+		return [][]byte{jsonOK(cmdHealthOK, `{"fresh":"health-reply"}`)}
+	})
+	got, err := drv.Health()
+	if err != nil {
+		t.Fatalf("Health after dropped stale frame failed (slot poisoned?): %v", err)
+	}
+	if got["fresh"] != "health-reply" {
+		t.Fatalf("Health got %v, want fresh health-reply", got)
+	}
+}
+
 func TestSendAndWaitReturnsWhenDaemonDisconnects(t *testing.T) {
 	t.Parallel()
 	d := newFakeDaemon(t)
