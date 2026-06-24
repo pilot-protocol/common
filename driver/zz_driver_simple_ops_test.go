@@ -4,6 +4,7 @@ package driver
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"testing"
 )
 
@@ -110,7 +111,7 @@ func TestDriverWaitForTrust(t *testing.T) {
 //   - the request frame is exactly [cmdPreferDirect(0x2D)][big-endian uint32 nodeID] (5 bytes),
 //   - the cmdPreferDirectOK (0x2E) reply is routed/accepted by readLoop (not dropped) —
 //     proven by the happy path returning a non-nil result and nil error, which only
-//     happens if the OK frame reaches the in-flight sendAndWait via c.pending,
+//     happens if the OK frame reaches the in-flight sendAndWait's active waiter,
 //   - the daemon's returned routing state is unmarshalled and surfaced.
 func TestDriverPreferDirect(t *testing.T) {
 	t.Parallel()
@@ -180,5 +181,85 @@ func TestDriverRotateKey(t *testing.T) {
 	}
 	if result == nil {
 		t.Errorf("RotateKey result is nil")
+	}
+}
+
+// TestDriverSubmitBadge covers SubmitBadge's JSON-RPC roundtrip: the request
+// frame is [cmdSubmitBadge][JSON{badge,badge_sig}] and the cmdSubmitBadgeOK
+// reply is routed and unmarshalled. A new response opcode that readLoop does
+// not allowlist would silently hang here — this pins that wiring.
+func TestDriverSubmitBadge(t *testing.T) {
+	t.Parallel()
+	d := newFakeDaemon(t)
+	defer d.close()
+
+	const wantBadge = "pilotbadge:v1:109517:github:1781827200:0:bdg-v1:"
+	const wantSig = "ZmFrZS1zaWc="
+
+	d.onCmd(cmdSubmitBadge, func(frame []byte) [][]byte {
+		if frame[0] != cmdSubmitBadge {
+			t.Errorf("opcode = 0x%02X, want 0x%02X", frame[0], cmdSubmitBadge)
+		}
+		var got map[string]string
+		if err := json.Unmarshal(frame[1:], &got); err != nil {
+			t.Errorf("payload not JSON: %v", err)
+			return [][]byte{{cmdError, 'b', 'a', 'd'}}
+		}
+		if got["badge"] != wantBadge || got["badge_sig"] != wantSig {
+			t.Errorf("payload = %+v, want badge=%q sig=%q", got, wantBadge, wantSig)
+		}
+		body := []byte(`{"ok":true}`)
+		return [][]byte{append([]byte{cmdSubmitBadgeOK}, body...)}
+	})
+
+	drv, err := Connect(d.path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer drv.Close()
+
+	result, err := drv.SubmitBadge(wantBadge, wantSig)
+	if err != nil {
+		t.Fatalf("SubmitBadge: %v", err)
+	}
+	if ok, _ := result["ok"].(bool); !ok {
+		t.Errorf("result = %+v, want ok=true", result)
+	}
+}
+
+// TestDriverEnrollRecovery covers EnrollRecovery's JSON-RPC roundtrip.
+func TestDriverEnrollRecovery(t *testing.T) {
+	t.Parallel()
+	d := newFakeDaemon(t)
+	defer d.close()
+
+	const wantEnroll = "pilotenroll:v1:109517:github:Y29tbWl0:1781827200:bdg-v1"
+	const wantSig = "ZW5yb2xsLXNpZw=="
+
+	d.onCmd(cmdEnrollRecovery, func(frame []byte) [][]byte {
+		var got map[string]string
+		if err := json.Unmarshal(frame[1:], &got); err != nil {
+			t.Errorf("payload not JSON: %v", err)
+			return [][]byte{{cmdError, 'b', 'a', 'd'}}
+		}
+		if got["enrollment"] != wantEnroll || got["enrollment_sig"] != wantSig {
+			t.Errorf("payload = %+v, want enrollment=%q sig=%q", got, wantEnroll, wantSig)
+		}
+		body := []byte(`{"ok":true}`)
+		return [][]byte{append([]byte{cmdEnrollRecoveryOK}, body...)}
+	})
+
+	drv, err := Connect(d.path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer drv.Close()
+
+	result, err := drv.EnrollRecovery(wantEnroll, wantSig)
+	if err != nil {
+		t.Fatalf("EnrollRecovery: %v", err)
+	}
+	if ok, _ := result["ok"].(bool); !ok {
+		t.Errorf("result = %+v, want ok=true", result)
 	}
 }

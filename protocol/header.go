@@ -47,6 +47,7 @@ const (
 	PortStdIO        uint16 = 1000
 	PortDataExchange uint16 = 1001
 	PortEventStream  uint16 = 1002
+	PortVerify       uint16 = 1003
 )
 
 // Port ranges

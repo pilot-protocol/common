@@ -27,6 +27,12 @@ import (
 // recoverable condition.
 var ErrNoRegistry = errors.New("registry client not configured")
 
+// dialTimeout bounds every TCP/TLS connection attempt to the registry so an
+// unreachable or black-holed registry host cannot hang startup or any
+// registry operation indefinitely. It matches the per-attempt timeout the
+// reconnect paths already use.
+const dialTimeout = 5 * time.Second
+
 // Client talks to a registry server over TCP (optionally TLS).
 // It automatically reconnects if the connection drops.
 //
@@ -126,7 +132,7 @@ func (c *Client) sign(challenge string) (string, error) {
 }
 
 func Dial(addr string) (*Client, error) {
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry: %w", err)
 	}
@@ -151,7 +157,7 @@ func DialPool(addr string, size int) (*Client, error) {
 	if size <= 0 {
 		size = 1
 	}
-	primary, err := net.Dial("tcp", addr)
+	primary, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry: %w", err)
 	}
@@ -169,7 +175,7 @@ func DialTLS(addr string, tlsConfig *tls.Config) (*Client, error) {
 	if tlsConfig == nil {
 		return nil, fmt.Errorf("TLS config required; use DialTLSPinned for certificate pinning")
 	}
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry TLS: %w", err)
 	}
@@ -184,7 +190,7 @@ func DialTLSPool(addr string, tlsConfig *tls.Config, size int) (*Client, error) 
 	if size <= 0 {
 		size = 1
 	}
-	primary, err := tls.Dial("tcp", addr, tlsConfig)
+	primary, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry TLS: %w", err)
 	}
@@ -210,9 +216,9 @@ func (c *Client) initPool(size int, tlsCfg *tls.Config) error {
 		var conn net.Conn
 		var err error
 		if tlsCfg != nil {
-			conn, err = tls.Dial("tcp", c.addr, tlsCfg)
+			conn, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", c.addr, tlsCfg)
 		} else {
-			conn, err = net.Dial("tcp", c.addr)
+			conn, err = net.DialTimeout("tcp", c.addr, dialTimeout)
 		}
 		if err != nil {
 			// Close any conns we already opened (excluding primary —
@@ -255,7 +261,7 @@ func DialTLSPinned(addr, fingerprint string) (*Client, error) {
 			return nil
 		},
 	}
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry TLS pinned: %w", err)
 	}
@@ -616,6 +622,45 @@ func (c *Client) RotateKey(nodeID uint32, signatureB64, newPubKeyB64 string) (ma
 		msg["new_public_key"] = newPubKeyB64
 	}
 	return c.Send(msg)
+}
+
+// SubmitBadge attaches a verified-address badge to a node. signatureB64 is a
+// signature by the node's CURRENT key over "submit_badge:<node_id>:<badge>",
+// proving ownership; the registry also verifies the badge offline against the
+// pinned issuer key.
+func (c *Client) SubmitBadge(nodeID uint32, badge, badgeSig, signatureB64 string) (map[string]interface{}, error) {
+	return c.Send(map[string]interface{}{
+		"type":      "submit_badge",
+		"node_id":   nodeID,
+		"badge":     badge,
+		"badge_sig": badgeSig,
+		"signature": signatureB64,
+	})
+}
+
+// EnrollRecovery records a node's opaque recovery commitment. signatureB64 is
+// a signature by the node's CURRENT key over
+// "enroll_recovery:<node_id>:<commitment>".
+func (c *Client) EnrollRecovery(nodeID uint32, enrollment, enrollmentSig, signatureB64 string) (map[string]interface{}, error) {
+	return c.Send(map[string]interface{}{
+		"type":           "enroll_recovery",
+		"node_id":        nodeID,
+		"enrollment":     enrollment,
+		"enrollment_sig": enrollmentSig,
+		"signature":      signatureB64,
+	})
+}
+
+// RecoverIdentity force-rotates a node's key to newPubKeyB64 using a
+// cold-key-signed recovery authorization — no current key required.
+func (c *Client) RecoverIdentity(nodeID uint32, recovery, recoverySig, newPubKeyB64 string) (map[string]interface{}, error) {
+	return c.Send(map[string]interface{}{
+		"type":           "recover_identity",
+		"node_id":        nodeID,
+		"recovery":       recovery,
+		"recovery_sig":   recoverySig,
+		"new_public_key": newPubKeyB64,
+	})
 }
 
 func (c *Client) Lookup(nodeID uint32) (map[string]interface{}, error) {

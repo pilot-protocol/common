@@ -20,21 +20,37 @@ import (
 const maxSendChunk = ipcutil.MaxMessageSize - 64
 
 // Conn implements net.Conn over a Pilot Protocol stream.
+//
+// Concurrency: like *net.TCPConn, a Conn may be used by at most one reader
+// and one writer goroutine at a time. Read serialises concurrent callers
+// with readMu (so recvBuf is never corrupted), but interleaving two
+// readers still yields each a non-deterministic slice of the stream; do
+// not do that. Write is safe for one writer; concurrent writers may
+// interleave chunks on the wire. SetDeadline/SetReadDeadline/
+// SetWriteDeadline are safe to call from any goroutine.
 type Conn struct {
 	id         uint32
 	localAddr  protocol.SocketAddr
 	remoteAddr protocol.SocketAddr
 	ipc        *ipcClient
 	recvCh     chan []byte
-	recvBuf    []byte // leftover from previous read
-	closed     bool
 
-	mu           sync.Mutex
-	readDeadline time.Time
-	deadlineCh   chan struct{} // closed when deadline is set/changed
+	// readMu serialises Read so recvBuf (leftover from a previous read)
+	// cannot be observed or mutated by two readers at once.
+	readMu  sync.Mutex
+	recvBuf []byte // leftover from previous read; guarded by readMu
+
+	mu            sync.Mutex
+	closed        bool
+	readDeadline  time.Time
+	writeDeadline time.Time
+	deadlineCh    chan struct{} // closed when deadline is set/changed
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
 	// Drain leftover first
 	if len(c.recvBuf) > 0 {
 		n := copy(b, c.recvBuf)
@@ -78,17 +94,36 @@ func (c *Conn) Read(b []byte) (int, error) {
 	}
 }
 
+// Write enqueues b to the local daemon over IPC, splitting it into
+// maxSendChunk-sized cmdSend frames.
+//
+// Send semantics: a nil error and n == len(b) mean every chunk was handed
+// to the local daemon over IPC — NOT that the bytes were transmitted on the
+// wire or acknowledged by the peer. The Pilot stream layer in the daemon
+// handles retransmission/ordering after this point; Write does not block on
+// it. Errors reported here are local IPC write failures or a passed
+// write deadline.
 func (c *Conn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return 0, protocol.ErrConnClosed
 	}
+	wdl := c.writeDeadline
 	c.mu.Unlock()
+
+	if !wdl.IsZero() && !time.Now().Before(wdl) {
+		return 0, os.ErrDeadlineExceeded
+	}
 
 	total := len(b)
 	written := 0
 	for written < total {
+		// Honour the write deadline between chunks so a large, slow write
+		// to a backed-up IPC socket cannot block past the deadline.
+		if !wdl.IsZero() && !time.Now().Before(wdl) {
+			return written, os.ErrDeadlineExceeded
+		}
 		chunk := total - written
 		if chunk > maxSendChunk {
 			chunk = maxSendChunk
@@ -125,7 +160,15 @@ func (c *Conn) LocalAddr() net.Addr  { return pilotAddr(c.localAddr) }
 func (c *Conn) RemoteAddr() net.Addr { return pilotAddr(c.remoteAddr) }
 
 func (c *Conn) SetDeadline(t time.Time) error {
-	c.SetReadDeadline(t)
+	c.mu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	// Signal any blocked Read to re-check.
+	if c.deadlineCh != nil {
+		close(c.deadlineCh)
+	}
+	c.deadlineCh = make(chan struct{})
+	c.mu.Unlock()
 	return nil
 }
 
@@ -141,7 +184,18 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *Conn) SetWriteDeadline(t time.Time) error { return nil }
+// SetWriteDeadline sets a deadline for Write. A passed deadline causes Write
+// to return os.ErrDeadlineExceeded. Because Write never blocks waiting on a
+// remote peer (it only enqueues chunks to the local daemon over IPC), the
+// deadline is enforced before each chunk rather than via an interrupt — a
+// zero time clears it. This satisfies the net.Conn contract instead of the
+// previous silent no-op.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDeadline = t
+	c.mu.Unlock()
+	return nil
+}
 
 // pilotAddr wraps SocketAddr to satisfy net.Addr.
 type pilotAddr protocol.SocketAddr

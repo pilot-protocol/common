@@ -1,0 +1,24 @@
+name: dependency-review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: dependency-review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The action hard-errors until the repo's Dependency Graph feature is
+      # enabled (Settings > Code security). continue-on-error keeps the job
+      # from blocking PRs before an admin flips that switch; once enabled the
+      # step reports real findings. Flip this to a hard gate after enabling.
+      - name: Dependency Review
+        continue-on-error: true
+        uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
