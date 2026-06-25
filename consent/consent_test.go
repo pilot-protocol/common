@@ -98,6 +98,19 @@ func TestGetConsent_MalformedConsentValue_DefaultsTrue(t *testing.T) {
 	}
 }
 
+func TestGetConsent_MalformedConfigFile_DefaultsTrue(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	// Config file exists but contains invalid JSON; readRaw returns a parse
+	// error and GetConsent falls back to the safe opt-out default (true).
+	writeConfig(t, home, `{not valid json`)
+	for _, flag := range []string{"telemetry", "broadcasts", "reviews"} {
+		if got := consent.GetConsent(home, flag); !got {
+			t.Errorf("GetConsent(%q) = false, want true (unparseable config → default true)", flag)
+		}
+	}
+}
+
 func TestGetConsent_UnknownFlag_DefaultsTrue(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
@@ -125,6 +138,17 @@ func TestSetConsent_InvalidFlag_DoesNotCreateFile(t *testing.T) {
 	_ = consent.SetConsent(home, "invalid_flag", true)
 	if _, err := os.Stat(filepath.Join(home, ".pilot", "config.json")); !os.IsNotExist(err) {
 		t.Error("config.json should not be created for invalid flag")
+	}
+}
+
+func TestSetConsent_MalformedConfigFile_ReturnsError(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	// A pre-existing unparseable config makes readRaw fail; SetConsent
+	// propagates the error rather than clobbering the file.
+	writeConfig(t, home, `{not valid json`)
+	if err := consent.SetConsent(home, "telemetry", false); err == nil {
+		t.Fatal("SetConsent on malformed config = nil error, want parse error")
 	}
 }
 
