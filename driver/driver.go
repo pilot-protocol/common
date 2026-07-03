@@ -382,6 +382,49 @@ func (d *Driver) EnrollRecovery(enrollment, enrollmentSig string) (map[string]in
 	return d.jsonRPC(msg, cmdEnrollRecoveryOK, "enroll_recovery")
 }
 
+// SignEnvelope asks the daemon to sign a request-signature envelope
+// (common/reqsig) for the given audience over the given body hash (64
+// lowercase hex chars — sha256 of the request body, see reqsig.HashBody).
+// The daemon constructs the envelope itself — its own address, the current
+// timestamp, a fresh nonce — and signs only the reqsig canonical form; it
+// never signs caller-supplied raw strings. Returns {envelope, signature,
+// address}.
+func (d *Driver) SignEnvelope(audience, bodyHash string) (map[string]interface{}, error) {
+	if bodyHash == "" {
+		return nil, fmt.Errorf("sign_envelope: body hash required")
+	}
+	data, _ := json.Marshal(map[string]string{"audience": audience, "body_hash": bodyHash})
+	msg := make([]byte, 1+len(data))
+	msg[0] = cmdSignEnvelope
+	copy(msg[1:], data)
+	return d.jsonRPC(msg, cmdSignEnvelopeOK, "sign_envelope")
+}
+
+// VerifyEnvelope checks a canonical reqsig envelope + base64 signature via
+// the daemon, which resolves the claimed node's key from its local cache
+// first and the registry on miss. With checkStanding the daemon also reports
+// the signer's registry standing (online, last_seen_unix, key_generation,
+// network_member) when the registry provides it. A failed check is NOT an
+// error — the reply carries valid=false plus a reason.
+func (d *Driver) VerifyEnvelope(envelope, sigB64 string, checkStanding bool) (map[string]interface{}, error) {
+	return d.VerifyEnvelopeMaxSkew(envelope, sigB64, checkStanding, 0)
+}
+
+// VerifyEnvelopeMaxSkew is VerifyEnvelope with an explicit freshness window
+// in seconds. 0 selects the daemon default (reqsig.DefaultMaxSkew).
+func (d *Driver) VerifyEnvelopeMaxSkew(envelope, sigB64 string, checkStanding bool, maxSkewSecs uint32) (map[string]interface{}, error) {
+	data, _ := json.Marshal(map[string]interface{}{
+		"envelope":       envelope,
+		"signature":      sigB64,
+		"check_standing": checkStanding,
+		"max_skew_secs":  maxSkewSecs,
+	})
+	msg := make([]byte, 1+len(data))
+	msg[0] = cmdVerifyEnvelope
+	copy(msg[1:], data)
+	return d.jsonRPC(msg, cmdVerifyEnvelopeOK, "verify_envelope")
+}
+
 // Disconnect closes a connection by ID. Used by administrative tools.
 // Fire-and-forget: the daemon always responds CmdCloseOK regardless of
 // whether the connID exists, so there is no error to propagate. Using
