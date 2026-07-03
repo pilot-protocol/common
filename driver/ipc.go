@@ -365,6 +365,9 @@ func (c *ipcClient) cleanup() {
 // writeFrame builds a `[cmd][body...]` envelope and writes it under
 // writeMu so frames don't interleave on the wire.
 func (c *ipcClient) writeFrame(cmd byte, body []byte) error {
+	if len(body) > ipcutil.MaxMessageSize-ipcEnvelopeHeaderSize {
+		return fmt.Errorf("ipc frame too large: %d bytes", len(body))
+	}
 	buf := make([]byte, ipcEnvelopeHeaderSize+len(body))
 	buf[0] = cmd
 	copy(buf[1:], body)
