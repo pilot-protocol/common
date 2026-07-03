@@ -406,9 +406,7 @@ func (d *Driver) SignEnvelope(audience, bodyHash string) (map[string]interface{}
 		return nil, fmt.Errorf("sign_envelope: audience must be 1-64 chars")
 	}
 	data, _ := json.Marshal(map[string]string{"audience": audience, "body_hash": bodyHash})
-	msg := make([]byte, 1+len(data))
-	msg[0] = cmdSignEnvelope
-	copy(msg[1:], data)
+	msg := append([]byte{cmdSignEnvelope}, data...)
 	return d.jsonRPC(msg, cmdSignEnvelopeOK, "sign_envelope")
 }
 
@@ -440,9 +438,7 @@ func (d *Driver) VerifyEnvelopeMaxSkew(envelope, sigB64 string, checkStanding bo
 		"check_standing": checkStanding,
 		"max_skew_secs":  maxSkewSecs,
 	})
-	msg := make([]byte, 1+len(data))
-	msg[0] = cmdVerifyEnvelope
-	copy(msg[1:], data)
+	msg := append([]byte{cmdVerifyEnvelope}, data...)
 	return d.jsonRPC(msg, cmdVerifyEnvelopeOK, "verify_envelope")
 }
 
