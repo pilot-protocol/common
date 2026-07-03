@@ -382,6 +382,15 @@ func (d *Driver) EnrollRecovery(enrollment, enrollmentSig string) (map[string]in
 	return d.jsonRPC(msg, cmdEnrollRecoveryOK, "enroll_recovery")
 }
 
+const (
+	// maxEnvelopeLen bounds a canonical reqsig envelope; real envelopes
+	// are <200 bytes (12-char domain, 12 hex addr, decimal ts, 16 hex
+	// nonce, 64 hex hash, <=64 char audience, 5 pipes).
+	maxEnvelopeLen = 512
+	// maxSigB64Len bounds a base64 ed25519 signature (88 chars).
+	maxSigB64Len = 128
+)
+
 // SignEnvelope asks the daemon to sign a request-signature envelope
 // (common/reqsig) for the given audience over the given body hash (64
 // lowercase hex chars — sha256 of the request body, see reqsig.HashBody).
@@ -390,8 +399,11 @@ func (d *Driver) EnrollRecovery(enrollment, enrollmentSig string) (map[string]in
 // never signs caller-supplied raw strings. Returns {envelope, signature,
 // address}.
 func (d *Driver) SignEnvelope(audience, bodyHash string) (map[string]interface{}, error) {
-	if bodyHash == "" {
-		return nil, fmt.Errorf("sign_envelope: body hash required")
+	if len(bodyHash) != 64 {
+		return nil, fmt.Errorf("sign_envelope: body hash must be 64 hex chars (sha256)")
+	}
+	if audience == "" || len(audience) > 64 {
+		return nil, fmt.Errorf("sign_envelope: audience must be 1-64 chars")
 	}
 	data, _ := json.Marshal(map[string]string{"audience": audience, "body_hash": bodyHash})
 	msg := make([]byte, 1+len(data))
@@ -413,6 +425,15 @@ func (d *Driver) VerifyEnvelope(envelope, sigB64 string, checkStanding bool) (ma
 // VerifyEnvelopeMaxSkew is VerifyEnvelope with an explicit freshness window
 // in seconds. 0 selects the daemon default (reqsig.DefaultMaxSkew).
 func (d *Driver) VerifyEnvelopeMaxSkew(envelope, sigB64 string, checkStanding bool, maxSkewSecs uint32) (map[string]interface{}, error) {
+	// Canonical envelopes are <200 bytes and a base64 ed25519 signature is
+	// 88 chars; bounding both rejects garbage client-side and keeps the
+	// request frame allocation size independent of caller input.
+	if envelope == "" || len(envelope) > maxEnvelopeLen {
+		return nil, fmt.Errorf("verify_envelope: envelope must be 1-%d bytes", maxEnvelopeLen)
+	}
+	if sigB64 == "" || len(sigB64) > maxSigB64Len {
+		return nil, fmt.Errorf("verify_envelope: signature must be 1-%d bytes", maxSigB64Len)
+	}
 	data, _ := json.Marshal(map[string]interface{}{
 		"envelope":       envelope,
 		"signature":      sigB64,
