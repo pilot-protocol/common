@@ -69,6 +69,16 @@ const (
 	cmdSubmitBadgeOK    byte = 0x30
 	cmdEnrollRecovery   byte = 0x31
 	cmdEnrollRecoveryOK byte = 0x32
+	// cmdSignEnvelope asks the daemon to sign a request-signature envelope
+	// (common/reqsig) naming its OWN address; cmdVerifyEnvelope checks a
+	// peer-produced envelope + signature against the peer's registered key.
+	// The daemon never signs caller-supplied raw strings — it constructs
+	// the envelope itself from the audience + body hash. Older daemons
+	// without these handlers reply cmdError.
+	cmdSignEnvelope     byte = 0x33
+	cmdSignEnvelopeOK   byte = 0x34
+	cmdVerifyEnvelope   byte = 0x35
+	cmdVerifyEnvelopeOK byte = 0x36
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)
@@ -232,7 +242,8 @@ func (c *ipcClient) readLoop() {
 			cmdResolveHostnameOK, cmdSetHostnameOK, cmdSetVisibilityOK,
 			cmdDeregisterOK, cmdSetTagsOK, cmdSetWebhookOK, cmdNetworkOK,
 			cmdHealthOK, cmdManagedOK, cmdRotateKeyOK, cmdBroadcastOK,
-			cmdPreferDirectOK, cmdSubmitBadgeOK, cmdEnrollRecoveryOK:
+			cmdPreferDirectOK, cmdSubmitBadgeOK, cmdEnrollRecoveryOK,
+			cmdSignEnvelopeOK, cmdVerifyEnvelopeOK:
 			// Known response cmds: deliver to the active sendAndWait waiter.
 			// If there is no active waiter (the request timed out / was
 			// abandoned, or this is a duplicate), the reply is dropped —
@@ -354,6 +365,9 @@ func (c *ipcClient) cleanup() {
 // writeFrame builds a `[cmd][body...]` envelope and writes it under
 // writeMu so frames don't interleave on the wire.
 func (c *ipcClient) writeFrame(cmd byte, body []byte) error {
+	if len(body) > ipcutil.MaxMessageSize-ipcEnvelopeHeaderSize {
+		return fmt.Errorf("ipc frame too large: %d bytes", len(body))
+	}
 	buf := make([]byte, ipcEnvelopeHeaderSize+len(body))
 	buf[0] = cmd
 	copy(buf[1:], body)

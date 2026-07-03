@@ -49,6 +49,11 @@ func Read(r io.Reader) ([]byte, error) {
 // daemon sends. For genuine shared-writer concurrency at the higher
 // layer, wrap the writer with your own mutex.
 func Write(w io.Writer, data []byte) error {
+	// Symmetric with Read: a frame the peer would reject on size is
+	// refused before allocation rather than written and dropped there.
+	if len(data) > MaxMessageSize {
+		return fmt.Errorf("ipc message too large: %d bytes (max %d)", len(data), MaxMessageSize)
+	}
 	frame := make([]byte, 4+len(data))
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
 	copy(frame[4:], data)
