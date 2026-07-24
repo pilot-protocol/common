@@ -596,6 +596,11 @@ func (c *Client) RegisterWithKeyOpts(o RegisterOpts) (map[string]interface{}, er
 	if o.RelayOnly {
 		msg["relay_only"] = true
 	}
+	if o.PublicKey != "" {
+		if sig, err := c.sign(fmt.Sprintf("register:%s:%s", o.ListenAddr, o.PublicKey)); err == nil {
+			msg["signature"] = sig
+		}
+	}
 	return c.Send(msg)
 }
 
