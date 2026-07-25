@@ -630,6 +630,12 @@ func VerifyAuthFrame(frame []byte, peerEdPubKey ed25519.PublicKey, peerX25519Pub
 	if len(frame) != AuthFrameLen {
 		return 0, fmt.Errorf("auth frame wrong size: %d", len(frame))
 	}
+	// ed25519.Verify panics on a key that is not exactly PublicKeySize
+	// bytes. peerEdPubKey reaches here from a registry lookup or a
+	// caller-supplied HandshakeConfig, so validate before use.
+	if len(peerEdPubKey) != ed25519.PublicKeySize {
+		return 0, fmt.Errorf("peer public key wrong size: %d", len(peerEdPubKey))
+	}
 
 	peerNodeID := binary.BigEndian.Uint32(frame[0:4])
 	peerTS := binary.BigEndian.Uint64(frame[4:12])
