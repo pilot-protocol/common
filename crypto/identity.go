@@ -34,8 +34,14 @@ func (id *Identity) Sign(message []byte) []byte {
 	return ed25519.Sign(id.PrivateKey, message)
 }
 
-// Verify checks a signature against the public key.
+// Verify checks a signature against the public key. A public key that is not
+// exactly ed25519.PublicKeySize bytes is rejected rather than passed to
+// ed25519.Verify, which panics on a wrong-length key — an attacker-supplied
+// key reaches this from unauthenticated message paths.
 func Verify(publicKey ed25519.PublicKey, message, signature []byte) bool {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return false
+	}
 	return ed25519.Verify(publicKey, message, signature)
 }
 
