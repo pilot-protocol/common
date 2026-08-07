@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -47,6 +49,27 @@ func TestReceiptExporterDiscoversEvidenceAppendedByAnotherProcess(t *testing.T) 
 	}
 	if calls.Load() != 1 || exporter.Pending() != 0 {
 		t.Fatalf("external receipt calls=%d pending=%d", calls.Load(), exporter.Pending())
+	}
+}
+
+func TestReceiptExporterSurfacesIncompleteExternalJournalRecord(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	journal, err := OpenReceiptJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter, err := NewReceiptExporter(ReceiptExporterConfig{
+		Journal: journal, Endpoint: "http://127.0.0.1:1/receipts", AckPath: filepath.Join(t.TempDir(), "acks"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := exporter.ExportOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "refresh receipt journal") {
+		t.Fatalf("incomplete external journal error=%v", err)
 	}
 }
 

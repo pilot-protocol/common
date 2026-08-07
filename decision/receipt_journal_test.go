@@ -6,10 +6,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/pilot-protocol/common/fsutil"
 )
 
 func journalReceipt(t *testing.T, observedAt int64, result EnforcementResult) Receipt {
@@ -105,5 +109,94 @@ func TestReceiptJournalRejectsUnsignedCorruptAndUnsafeFiles(t *testing.T) {
 	}
 	if _, err := OpenReceiptJournal(filepath.Join(directory, "link.jsonl")); err == nil {
 		t.Fatal("symlink journal was accepted")
+	}
+}
+
+func TestReceiptJournalRefreshRejectsUnsafeExternalChanges(t *testing.T) {
+	t.Parallel()
+	if err := (*ReceiptJournal)(nil).Refresh(); err == nil {
+		t.Fatal("nil journal refresh succeeded")
+	}
+	t.Run("incomplete record", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "receipts.jsonl")
+		journal, err := OpenReceiptJournal(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := journal.Refresh(); err == nil || !strings.Contains(err.Error(), "incomplete trailing record") {
+			t.Fatalf("incomplete refresh error=%v", err)
+		}
+	})
+	t.Run("truncated journal", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "receipts.jsonl")
+		journal, err := OpenReceiptJournal(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := journal.AppendReceipt(context.Background(), journalReceipt(t, 1785500000, Enforced)); err != nil {
+			t.Fatal(err)
+		}
+		if err := journal.Refresh(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := journal.Refresh(); err == nil || !strings.Contains(err.Error(), "truncated") {
+			t.Fatalf("truncated refresh error=%v", err)
+		}
+	})
+	t.Run("symlink replacement", func(t *testing.T) {
+		directory := t.TempDir()
+		path := filepath.Join(directory, "receipts.jsonl")
+		journal, err := OpenReceiptJournal(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(directory, "target.jsonl")
+		if err := os.WriteFile(target, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+		if err := journal.Refresh(); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("symlink refresh error=%v", err)
+		}
+	})
+}
+
+func TestReceiptJournalRefreshRejectsConflictingExternalRecord(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	journal, err := OpenReceiptJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := journalReceipt(t, 1785500000, Enforced)
+	if err := journal.AppendReceipt(context.Background(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	conflict := receipt
+	conflict.ObservedAt++
+	_, privateKey, _ := ed25519.GenerateKey(rand.Reader)
+	if err := conflict.Sign(privateKey); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(conflict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsutil.AppendSync(path, append(body, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Refresh(); err == nil || !strings.Contains(err.Error(), "conflicting receipt journal id") {
+		t.Fatalf("conflicting refresh error=%v", err)
 	}
 }
