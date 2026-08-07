@@ -7,10 +7,71 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
+
+func TestReceiptExporterDiscoversEvidenceAppendedByAnotherProcess(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	exporterJournal, err := OpenReceiptJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerJournal, err := OpenReceiptJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := journalReceipt(t, 1785500000, Enforced)
+	if err := writerJournal.AppendReceipt(context.Background(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.Header.Get("Idempotency-Key") != receipt.ID {
+			t.Errorf("idempotency key=%q", request.Header.Get("Idempotency-Key"))
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]string{"accepted_receipt_id": receipt.ID})
+	}))
+	defer server.Close()
+	exporter, err := NewReceiptExporter(ReceiptExporterConfig{
+		Journal: exporterJournal, Endpoint: server.URL, AckPath: filepath.Join(t.TempDir(), "acks"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exporter.ExportOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 || exporter.Pending() != 0 {
+		t.Fatalf("external receipt calls=%d pending=%d", calls.Load(), exporter.Pending())
+	}
+}
+
+func TestReceiptExporterSurfacesIncompleteExternalJournalRecord(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	journal, err := OpenReceiptJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter, err := NewReceiptExporter(ReceiptExporterConfig{
+		Journal: journal, Endpoint: "http://127.0.0.1:1/receipts", AckPath: filepath.Join(t.TempDir(), "acks"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := exporter.ExportOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "refresh receipt journal") {
+		t.Fatalf("incomplete external journal error=%v", err)
+	}
+}
 
 func TestReceiptExporterRetriesAndAcknowledgesSignedEvidence(t *testing.T) {
 	t.Parallel()

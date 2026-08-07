@@ -27,6 +27,7 @@ type ReceiptJournal struct {
 	mu       sync.Mutex
 	seen     map[string]string
 	receipts []Receipt
+	offset   int64
 }
 
 func OpenReceiptJournal(path string) (*ReceiptJournal, error) {
@@ -46,7 +47,7 @@ func OpenReceiptJournal(path string) (*ReceiptJournal, error) {
 		return nil, fmt.Errorf("decision: create receipt journal directory: %w", err)
 	}
 	journal := &ReceiptJournal{path: absolute, seen: make(map[string]string)}
-	if err := journal.load(); err != nil {
+	if err := journal.refreshLocked(); err != nil {
 		return nil, err
 	}
 	return journal, nil
@@ -107,11 +108,31 @@ func (journal *ReceiptJournal) Receipts() []Receipt {
 	return append([]Receipt(nil), journal.receipts...)
 }
 
-func (journal *ReceiptJournal) load() error {
-	file, err := os.Open(journal.path)
+// Refresh discovers complete records appended by another process after this
+// journal was opened. Managed hooks and the long-running daemon deliberately
+// use separate processes, so exporters must refresh before inspecting their
+// in-memory snapshot. Existing records are not rescanned on every poll.
+func (journal *ReceiptJournal) Refresh() error {
+	if journal == nil || journal.path == "" {
+		return fmt.Errorf("decision: receipt journal is not initialized")
+	}
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	return journal.refreshLocked()
+}
+
+func (journal *ReceiptJournal) refreshLocked() error {
+	pathInfo, err := os.Lstat(journal.path)
 	if os.IsNotExist(err) {
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("decision: inspect receipt journal: %w", err)
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("decision: receipt journal must not be a symlink")
+	}
+	file, err := os.Open(journal.path)
 	if err != nil {
 		return fmt.Errorf("decision: open receipt journal: %w", err)
 	}
@@ -123,9 +144,28 @@ func (journal *ReceiptJournal) load() error {
 	if info.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("decision: receipt journal permissions must be owner-only")
 	}
-	scanner := bufio.NewScanner(file)
+	if info.Size() < journal.offset {
+		return fmt.Errorf("decision: receipt journal was truncated")
+	}
+	if info.Size() == journal.offset {
+		return nil
+	}
+	var last [1]byte
+	if _, err := file.ReadAt(last[:], info.Size()-1); err != nil {
+		return fmt.Errorf("decision: inspect receipt journal boundary: %w", err)
+	}
+	if last[0] != '\n' {
+		return fmt.Errorf("decision: receipt journal has an incomplete trailing record")
+	}
+	scanner := bufio.NewScanner(io.NewSectionReader(file, journal.offset, info.Size()-journal.offset))
 	scanner.Buffer(make([]byte, 64<<10), MaxReceiptJournalLineBytes+1)
-	line := 0
+	line := len(journal.receipts)
+	type pendingReceipt struct {
+		receipt Receipt
+		hash    string
+	}
+	pending := make([]pendingReceipt, 0)
+	pendingSeen := make(map[string]string)
 	for scanner.Scan() {
 		line++
 		decoder := json.NewDecoder(bytes.NewReader(scanner.Bytes()))
@@ -148,12 +188,26 @@ func (journal *ReceiptJournal) load() error {
 		if existing, exists := journal.seen[receipt.ID]; exists && existing != hash {
 			return fmt.Errorf("decision: conflicting receipt journal id %q", receipt.ID)
 		}
-		journal.seen[receipt.ID] = hash
-		journal.receipts = append(journal.receipts, receipt)
+		if existing, exists := pendingSeen[receipt.ID]; exists && existing != hash {
+			return fmt.Errorf("decision: conflicting receipt journal id %q", receipt.ID)
+		}
+		if existing, exists := journal.seen[receipt.ID]; exists && existing == hash {
+			continue
+		}
+		if existing, exists := pendingSeen[receipt.ID]; exists && existing == hash {
+			continue
+		}
+		pendingSeen[receipt.ID] = hash
+		pending = append(pending, pendingReceipt{receipt: receipt, hash: hash})
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("decision: scan receipt journal: %w", err)
 	}
+	for _, record := range pending {
+		journal.seen[record.receipt.ID] = record.hash
+		journal.receipts = append(journal.receipts, record.receipt)
+	}
+	journal.offset = info.Size()
 	return nil
 }
 
