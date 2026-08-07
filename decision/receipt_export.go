@@ -121,6 +121,9 @@ func (exporter *ReceiptExporter) ExportOnce(ctx context.Context) error {
 	}
 	exporter.mu.Lock()
 	defer exporter.mu.Unlock()
+	if err := exporter.journal.Refresh(); err != nil {
+		return fmt.Errorf("decision: refresh receipt journal: %w", err)
+	}
 	attempted := 0
 	var firstErr error
 	for _, receipt := range exporter.journal.Receipts() {
