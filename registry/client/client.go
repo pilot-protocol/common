@@ -57,8 +57,9 @@ const dialTimeout = 5 * time.Second
 // client's connections (initial, pool and reconnect) through a custom
 // dialer, e.g. an HTTP CONNECT proxy from the netproxy package.
 type Client struct {
-	// Primary connection. Always present; tests in this package read
-	// c.conn / c.mu / c.closed directly so the field set must stay stable.
+	// Primary connection. nil only while a dropped connection waits for
+	// its redial. Tests in this package read c.conn / c.mu / c.closed
+	// directly so the field set must stay stable.
 	conn      net.Conn
 	mu        sync.Mutex
 	addr      string // registry address for reconnection
@@ -69,15 +70,33 @@ type Client struct {
 	// instead of a direct net.Dialer — see WithDialer. Immutable after
 	// construction.
 	dial DialContextFunc
+	// connDialedAt is when c.conn was established (single-conn path; guarded
+	// by c.mu). Its age tells a rate-limit close from an idle one.
+	connDialedAt time.Time
 
 	// Optional pool of secondary connections used to parallelise Send.
 	// nil / empty when DialPool was not used.
 	pool poolState
+
+	// closeOnce makes Close idempotent: the teardown (closing done and every
+	// connection) runs exactly once however many goroutines call Close.
+	closeOnce sync.Once
+	// done is closed by Close. It wakes goroutines parked on the pool's
+	// free list or in a reconnect backoff. Created lazily by doneCh so the
+	// zero-value Client works.
+	doneOnce sync.Once
+	done     chan struct{}
+
+	// reconn holds the reconnect backoff streaks and log counters shared by
+	// every connection of this client.
+	reconn reconnectTracker
+	// logger overrides slog.Default() (tests only).
+	logger *slog.Logger
 }
 
 // poolState holds the secondary-conn pool. The primary slot (c.conn / c.mu)
-// is also represented here as the first entry, so acquireConn / releaseConn
-// can pick uniformly across all conns.
+// is also represented here as the first entry, so acquireEntry /
+// releaseEntry can pick uniformly across all conns.
 type poolState struct {
 	// entries is the full set of conns including the primary at index 0.
 	// Each entry has its own mu — taking entry.mu lets one Send proceed
@@ -87,20 +106,31 @@ type poolState struct {
 	// free is a buffered channel of pointers to entries currently free.
 	// Capacity equals len(entries). Send: <-free; defer free<-entry.
 	// nil means "no pool" (legacy single-conn path via c.mu).
+	// It is never closed: Close closes c.done instead, which avoids the
+	// race between close(free) and concurrent sends on free.
 	free chan *pooledConn
-	// done is closed by Close() to wake goroutines blocked on <-free and to
-	// signal the deferred pool-return in sendPool to drop its entry instead
-	// of sending on free. Using a separate done channel avoids the race
-	// between close(free) and concurrent sends on free.
-	done chan struct{}
 }
 
-// pooledConn wraps one TCP connection plus its own mutex. The mutex
-// guards both the conn pointer and any reconnect that happens through
-// it; sendOnEntry takes it for the full write/read round-trip.
+// pooledConn wraps one registry connection plus its own mutex. The Send
+// that took the entry off the free list holds mu for its whole round trip
+// (including any redial). conn is written only with both mu and the
+// client's c.mu held, so Close can snapshot it under c.mu alone.
 type pooledConn struct {
 	mu   sync.Mutex
 	conn net.Conn
+	// dialedAt is when conn was established (guarded by mu).
+	dialedAt time.Time
+	// broken, when non-nil, is the error that dropped conn; the entry must
+	// be redialed before reuse (guarded by mu).
+	broken error
+}
+
+// healthy reports whether the entry can be used without a redial. The
+// caller must own the entry (it came off the free list).
+func (e *pooledConn) healthy() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.broken == nil && e.conn != nil
 }
 
 // SetSigner sets a signing function for authenticated registry operations (H3 fix).
@@ -148,7 +178,12 @@ func Dial(addr string, opts ...DialOption) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial registry: %w", err)
 	}
-	return &Client{conn: conn, addr: addr, dial: o.dial}, nil
+	return newClient(conn, addr, nil, o.dial), nil
+}
+
+// newClient wraps an established primary connection.
+func newClient(conn net.Conn, addr string, tlsConfig *tls.Config, dial DialContextFunc) *Client {
+	return &Client{conn: conn, addr: addr, tlsConfig: tlsConfig, dial: dial, connDialedAt: time.Now()}
 }
 
 // DialPool connects to a registry server over plain TCP and pre-warms a
@@ -174,7 +209,7 @@ func DialPool(addr string, size int, opts ...DialOption) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial registry: %w", err)
 	}
-	c := &Client{conn: primary, addr: addr, dial: o.dial}
+	c := newClient(primary, addr, nil, o.dial)
 	if err := c.initPool(size, nil); err != nil {
 		primary.Close()
 		return nil, err
@@ -193,7 +228,7 @@ func DialTLS(addr string, tlsConfig *tls.Config, opts ...DialOption) (*Client, e
 	if err != nil {
 		return nil, fmt.Errorf("dial registry TLS: %w", err)
 	}
-	return &Client{conn: conn, addr: addr, tlsConfig: tlsConfig, dial: o.dial}, nil
+	return newClient(conn, addr, tlsConfig, o.dial), nil
 }
 
 // DialTLSPool is the TLS variant of DialPool.
@@ -212,7 +247,7 @@ func dialTLSPool(addr string, tlsConfig *tls.Config, size int, errPrefix string,
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", errPrefix, err)
 	}
-	c := &Client{conn: primary, addr: addr, tlsConfig: tlsConfig, dial: o.dial}
+	c := newClient(primary, addr, tlsConfig, o.dial)
 	if err := c.initPool(size, tlsConfig); err != nil {
 		primary.Close()
 		return nil, err
@@ -230,7 +265,7 @@ func (c *Client) initPool(size int, tlsCfg *tls.Config) error {
 		return nil
 	}
 	entries := make([]*pooledConn, 0, size)
-	entries = append(entries, &pooledConn{conn: c.conn})
+	entries = append(entries, &pooledConn{conn: c.conn, dialedAt: c.connDialedAt})
 	for i := 1; i < size; i++ {
 		conn, err := dialConn(context.Background(), c.dial, c.addr, tlsCfg)
 		if err != nil {
@@ -241,7 +276,7 @@ func (c *Client) initPool(size int, tlsCfg *tls.Config) error {
 			}
 			return fmt.Errorf("dial pool conn %d: %w", i, err)
 		}
-		entries = append(entries, &pooledConn{conn: conn})
+		entries = append(entries, &pooledConn{conn: conn, dialedAt: time.Now()})
 	}
 	free := make(chan *pooledConn, len(entries))
 	for _, e := range entries {
@@ -249,7 +284,6 @@ func (c *Client) initPool(size int, tlsCfg *tls.Config) error {
 	}
 	c.pool.entries = entries
 	c.pool.free = free
-	c.pool.done = make(chan struct{})
 	return nil
 }
 
@@ -262,7 +296,7 @@ func DialTLSPinned(addr, fingerprint string, opts ...DialOption) (*Client, error
 	if err != nil {
 		return nil, fmt.Errorf("dial registry TLS pinned: %w", err)
 	}
-	return &Client{conn: conn, addr: addr, tlsConfig: tlsConfig, dial: o.dial}, nil
+	return newClient(conn, addr, tlsConfig, o.dial), nil
 }
 
 // DialTLSPinnedPool is the pooled variant of DialTLSPinned (see DialPool).
@@ -293,83 +327,197 @@ func pinnedTLSConfig(fingerprint string) *tls.Config {
 	}
 }
 
+// Close closes every registry connection of the client. It is idempotent
+// and safe to call concurrently with itself and with in-flight requests:
+// the teardown runs exactly once, later calls return nil, and every request
+// that is in flight or starts afterwards fails with an error matching
+// ErrClosed (and ErrNoRegistry) instead of panicking.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
 	}
+	var err error
+	c.closeOnce.Do(func() { err = c.shutdown() })
+	return err
+}
+
+// shutdown is Close's one-time teardown.
+func (c *Client) shutdown() error {
+	// Wake goroutines parked on the pool's free list or in a reconnect
+	// backoff before taking c.mu: the single-conn path holds c.mu for its
+	// whole round trip, reconnect waits included.
+	close(c.doneCh())
+
 	c.mu.Lock()
 	c.closed = true
-	conn := c.conn
-	pool := c.pool.entries
+	// Snapshot every live conn. Entry conns are only replaced under c.mu,
+	// and nothing closes a conn once closed is set, so each conn is closed
+	// exactly once, here. In pool mode entries[0] shares the primary conn
+	// with c.conn, so c.conn is not closed separately.
+	var conns []net.Conn
+	if len(c.pool.entries) > 0 {
+		for _, e := range c.pool.entries {
+			if e.conn != nil {
+				conns = append(conns, e.conn)
+			}
+		}
+	} else if c.conn != nil {
+		conns = append(conns, c.conn)
+	}
 	c.mu.Unlock()
-	// Close the conn after releasing the lock; conn is captured by value
-	// so reconnect() can't see it after we set c.closed=true (M7 fix)
+
+	// Closing a conn in use interrupts its Read/Write; that request then
+	// sees the client closed and returns ErrClosed. Close does not wait
+	// for in-flight pooled requests.
 	var firstErr error
-	if conn != nil {
-		if err := conn.Close(); err != nil {
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && firstErr == nil {
 			firstErr = err
 		}
 	}
-	// Close every secondary pooled conn. The primary is already closed
-	// above (entries[0] holds the same fd as c.conn). Skip index 0 so
-	// we don't double-close.
-	for i := 1; i < len(pool); i++ {
-		e := pool[i]
-		// Take e.mu to coordinate with any in-flight sendOnEntry that
-		// holds it; once we release the mutex it'll see a closed conn
-		// on its next Read/Write and return an error to the caller.
-		e.mu.Lock()
-		if e.conn != nil {
-			if err := e.conn.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-		e.mu.Unlock()
-	}
-	// Close pool.done to wake any goroutine blocked on <-c.pool.free and to
-	// signal the deferred pool-return in sendPool to drop its entry. We never
-	// close pool.free itself because that would race with concurrent sends on
-	// it from the sendPool defer.
-	if c.pool.done != nil {
-		close(c.pool.done)
-	}
+	c.logSummary(c.reconn.stop())
 	return firstErr
 }
 
-// reconnect re-establishes the TCP connection to the registry.
-// Must be called with c.mu held.
-func (c *Client) reconnect(ctx context.Context) error {
-	if c.closed {
-		return fmt.Errorf("client closed")
+// doneCh returns the channel Close closes, creating it on first use.
+func (c *Client) doneCh() chan struct{} {
+	c.doneOnce.Do(func() { c.done = make(chan struct{}) })
+	return c.done
+}
+
+// closing reports whether Close has started. Unlike isClosed it takes no
+// lock, so it is safe on the single-conn path, which holds c.mu.
+func (c *Client) closing() bool {
+	select {
+	case <-c.doneCh():
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) log() *slog.Logger {
+	if c.logger != nil {
+		return c.logger
+	}
+	return slog.Default()
+}
+
+// logSummary emits the periodic reconnect summary (attrs from the
+// tracker; nil means nothing to report).
+func (c *Client) logSummary(attrs []any) {
+	if attrs == nil {
+		return
+	}
+	c.log().Info("registry reconnect summary", append([]any{"addr", c.addr}, attrs...)...)
+}
+
+// noteConnError records a connection-level request failure (the triggering
+// error of the reconnect that follows) and logs it at Debug.
+func (c *Client) noteConnError(err error, age time.Duration) {
+	rapid := c.reconn.connError(err, age, c.logSummary)
+	c.log().Debug("registry conn dropped", "addr", c.addr, "err", err,
+		"conn_age", age.Round(time.Millisecond).String(), "rapid_close", rapid)
+}
+
+// dialWithBackoff opens a replacement connection after cause broke the old
+// one. It first waits out the client-wide cooldown, which is zero until the
+// registry keeps closing connections shortly after they are used (its rate
+// limiter's signature) or whole reconnects keep failing. Then it makes up
+// to maxReconnectAttempts dials with jittered exponential backoff between
+// them. It returns early when ctx is done or the client is closed.
+//
+// It takes no lock, so the single-conn path may call it with c.mu held.
+func (c *Client) dialWithBackoff(ctx context.Context, what string, cause error) (net.Conn, error) {
+	if err := sleepCtx(ctx, c.doneCh(), c.reconn.cooldown()); err != nil {
+		return nil, err
+	}
+	p := c.reconn.pol()
+	backoff := p.dialBase
+	var err error
+	for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
+		if c.closing() {
+			return nil, ErrClosed
+		}
+		var conn net.Conn
+		conn, err = dialConn(ctx, c.dial, c.addr, c.tlsConfig)
+		if err == nil {
+			return conn, nil
+		}
+		c.log().Warn(what+" reconnect failed", "addr", c.addr, "attempt", attempt, "err", err, "cause", errText(cause))
+		c.reconn.dialFailed(c.logSummary)
+		if attempt == maxReconnectAttempts {
+			break
+		}
+		if werr := sleepCtx(ctx, c.doneCh(), jitter(backoff)); werr != nil {
+			return nil, werr
+		}
+		if backoff *= 2; backoff > p.dialMax {
+			backoff = p.dialMax
+		}
+	}
+	c.reconn.exhausted()
+	return nil, fmt.Errorf("reconnect failed after %d attempts: %w", maxReconnectAttempts, err)
+}
+
+// noteReconnected logs one successful redial at Debug (with the error that
+// triggered it) and feeds the periodic INFO summary.
+func (c *Client) noteReconnected(what string, cause error) {
+	c.reconn.reconnected(cause, c.logSummary)
+	c.log().Debug(what+" reconnected", "addr", c.addr, "cause", errText(cause))
+}
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// reconnectFailed builds the error for a request whose connection broke
+// (cause) and could not be redialed (reconnErr). Both stay in the chain.
+func reconnectFailed(cause, reconnErr error) error {
+	if errors.Is(reconnErr, ErrClosed) {
+		return closedDuring(cause)
+	}
+	if cause == nil {
+		cause = errNotConnected
+	}
+	return fmt.Errorf("send failed and reconnect failed: %w (reconnect: %w)", cause, reconnErr)
+}
+
+// retriedAfter annotates the error of a retry that also failed at the
+// connection level with the error that triggered the reconnect.
+func retriedAfter(err, cause error) error {
+	return fmt.Errorf("%w (retried after reconnect; first failure: %v)", err, cause)
+}
+
+// reconnect re-establishes the single-conn path's connection after cause
+// broke it. Must be called with c.mu held.
+func (c *Client) reconnect(ctx context.Context, cause error) error {
+	if c.closed || c.closing() {
+		return ErrClosed
 	}
 	if c.conn != nil {
 		c.conn.Close()
+		// Retired: a failed redial leaves no conn behind for Close to
+		// close a second time.
+		c.conn = nil
 	}
-
-	var conn net.Conn
-	var err error
-	backoff := 500 * time.Millisecond
-	maxBackoff := 10 * time.Second
-
-	for attempts := 0; attempts < 5; attempts++ {
-		conn, err = dialConn(ctx, c.dial, c.addr, c.tlsConfig)
-		if err == nil {
-			c.conn = conn
-			slog.Info("registry reconnected", "addr", c.addr)
-			return nil
-		}
-		slog.Warn("registry reconnect failed", "attempt", attempts+1, "err", err)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+	conn, err := c.dialWithBackoff(ctx, "registry", cause)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("reconnect failed after 5 attempts: %w", err)
+	if c.closing() {
+		// Close started while we were dialing and is waiting for c.mu;
+		// do not hand it a conn to close, and do not retry on it.
+		conn.Close()
+		return ErrClosed
+	}
+	c.conn = conn
+	c.connDialedAt = time.Now()
+	c.noteReconnected("registry", cause)
+	return nil
 }
 
 // Send sends a registry message without a deadline. For shutdown-safe use
@@ -382,6 +530,11 @@ func (c *Client) Send(msg map[string]interface{}) (map[string]interface{}, error
 // reconnect retries. Callers should pass a context with deadline or
 // cancellation (e.g. daemon shutdown context) so that reconnect backoff
 // does not block graceful stop.
+//
+// A connection-level failure (no response) is retried once: on a pooled
+// client first on another idle, healthy connection, then after redialing.
+// An error response from the registry is returned as is, never retried.
+// After Close every call returns an error matching ErrClosed.
 func (c *Client) SendContext(ctx context.Context, msg map[string]interface{}) (map[string]interface{}, error) {
 	// Nil receiver — return a sentinel rather than panicking. Every
 	// exported wrapper method (Register, Lookup, Resolve, …) funnels
@@ -401,16 +554,31 @@ func (c *Client) SendContext(ctx context.Context, msg map[string]interface{}) (m
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed || c.closing() {
+		return nil, ErrClosed
+	}
 
 	resp, err := c.sendLocked(msg)
-	if err != nil && resp == nil && !c.closed {
+	if err != nil && resp == nil {
 		// Connection-level failure (no response received) — reconnect and retry once.
 		// Server error responses (resp != nil) do NOT trigger reconnection.
-		if reconnErr := c.reconnect(ctx); reconnErr != nil {
-			return nil, fmt.Errorf("send failed and reconnect failed: %w", err)
+		if c.closing() {
+			return nil, closedDuring(err)
+		}
+		cause := err
+		c.noteConnError(cause, time.Since(c.connDialedAt))
+		if reconnErr := c.reconnect(ctx, cause); reconnErr != nil {
+			return nil, reconnectFailed(cause, reconnErr)
 		}
 		resp, err = c.sendLocked(msg)
+		if err != nil && resp == nil {
+			if c.closing() {
+				return nil, closedDuring(err)
+			}
+			return nil, retriedAfter(err, cause)
+		}
 	}
+	c.reconn.healthy(time.Since(c.connDialedAt))
 	return resp, err
 }
 
@@ -420,105 +588,208 @@ func (c *Client) SendContext(ctx context.Context, msg map[string]interface{}) (m
 func (c *Client) sendPool(ctx context.Context, msg map[string]interface{}) (map[string]interface{}, error) {
 	// Cheap closed check — avoids a wedged caller waiting on a free
 	// channel that nobody will ever return to once Close has run.
-	c.mu.Lock()
-	closed := c.closed
-	c.mu.Unlock()
-	if closed {
-		return nil, fmt.Errorf("client closed")
+	if c.isClosed() {
+		return nil, ErrClosed
 	}
-
-	var entry *pooledConn
-	select {
-	case entry = <-c.pool.free:
-	case <-c.pool.done:
-		return nil, fmt.Errorf("client closed")
+	entry, err := c.acquireEntry(ctx)
+	if err != nil {
+		return nil, err
 	}
-	defer func() {
-		select {
-		case c.pool.free <- entry:
-		case <-c.pool.done:
-			// pool is torn down; drop the entry
-		}
-	}()
-
+	defer c.releaseEntry(entry)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
-	resp, err := c.sendOnEntry(entry, msg)
-	if err != nil && resp == nil && !c.isClosed() {
-		// Connection-level failure on this entry — reconnect THIS entry
-		// only (other pool entries are unaffected) and retry once.
-		if reconnErr := c.reconnectEntry(ctx, entry); reconnErr != nil {
-			return nil, fmt.Errorf("send failed and reconnect failed: %w", err)
+	// An earlier request dropped this entry's conn (and was served
+	// elsewhere, or its redial failed): redial before use.
+	if entry.broken != nil || entry.conn == nil {
+		if rerr := c.reconnectEntry(ctx, entry, entry.broken); rerr != nil {
+			return nil, reconnectFailed(entry.broken, rerr)
 		}
-		resp, err = c.sendOnEntry(entry, msg)
+	}
+
+	resp, err := c.sendOnEntry(entry, msg)
+	if err == nil || resp != nil {
+		return resp, err
+	}
+	if c.isClosed() {
+		return nil, closedDuring(err)
+	}
+	cause := err
+
+	// The connection was dropped (EOF, reset, closed). The other entries
+	// were dialed at other times and may still be good, so retry once on
+	// an idle healthy one before paying for a redial and any cooldown.
+	// Timeouts are not retried this way: a half-open conn already cost
+	// the caller the full read deadline.
+	if isConnDropped(cause) {
+		if resp, served, err := c.sendOnOtherEntry(msg); served {
+			return resp, err
+		}
+		if c.isClosed() {
+			return nil, closedDuring(cause)
+		}
+	}
+
+	// Redial this entry and retry once.
+	if rerr := c.reconnectEntry(ctx, entry, cause); rerr != nil {
+		return nil, reconnectFailed(cause, rerr)
+	}
+	resp, err = c.sendOnEntry(entry, msg)
+	if err != nil && resp == nil {
+		if c.isClosed() {
+			return nil, closedDuring(err)
+		}
+		return nil, retriedAfter(err, cause)
 	}
 	return resp, err
 }
 
-// sendOnEntry writes the request and reads the response on entry.conn.
-// Caller must hold entry.mu.
-func (c *Client) sendOnEntry(entry *pooledConn, msg map[string]interface{}) (map[string]interface{}, error) {
-	if err := wire.WriteMessage(entry.conn, msg); err != nil {
-		return nil, fmt.Errorf("send: %w", err)
+// acquireEntry takes a pool entry off the free list, preferring an idle
+// healthy one and otherwise blocking until any entry is free, ctx is done
+// or the client is closed.
+func (c *Client) acquireEntry(ctx context.Context) (*pooledConn, error) {
+	if e := c.tryAcquireHealthy(); e != nil {
+		return e, nil
 	}
-	entry.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	resp, err := wire.ReadMessage(entry.conn)
-	entry.conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		return nil, fmt.Errorf("recv: %w", err)
+	select {
+	case e := <-c.pool.free:
+		if c.closing() {
+			c.releaseEntry(e)
+			return nil, ErrClosed
+		}
+		return e, nil
+	case <-c.doneCh():
+		return nil, ErrClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	if errVal, ok := resp["error"]; ok {
-		return resp, fmt.Errorf("registry: %v", errVal)
-	}
-	// PILOT-132: reject valid JSON that lacks the expected "type" envelope key.
-	if _, hasType := resp["type"]; !hasType && len(resp) > 0 {
-		return resp, fmt.Errorf("registry: malformed response (missing %q field)", "type")
-	}
-	return resp, nil
 }
 
-// reconnectEntry redials a single pool entry. Caller must hold entry.mu.
-// This is the per-entry analogue of Client.reconnect.
-func (c *Client) reconnectEntry(ctx context.Context, entry *pooledConn) error {
-	if c.isClosed() {
-		return fmt.Errorf("client closed")
-	}
-	if entry.conn != nil {
-		entry.conn.Close()
-	}
-
-	var conn net.Conn
-	var err error
-	backoff := 500 * time.Millisecond
-	maxBackoff := 10 * time.Second
-	for attempts := 0; attempts < 5; attempts++ {
-		conn, err = dialConn(ctx, c.dial, c.addr, c.tlsConfig)
-		if err == nil {
-			entry.conn = conn
-			// Keep c.conn (primary) in sync if this is the primary entry.
-			// Tests in this package read c.conn directly, so we must not
-			// leave it pointing at a closed fd.
-			if entry == c.pool.entries[0] {
-				c.mu.Lock()
-				c.conn = conn
-				c.mu.Unlock()
+// tryAcquireHealthy takes an idle entry that needs no redial off the free
+// list without blocking. It returns nil when none is free right now.
+func (c *Client) tryAcquireHealthy() *pooledConn {
+	var skipped []*pooledConn
+	defer func() {
+		for _, e := range skipped {
+			c.releaseEntry(e)
+		}
+	}()
+	for range len(c.pool.entries) {
+		select {
+		case e := <-c.pool.free:
+			if e.healthy() {
+				return e
 			}
-			slog.Info("registry pool conn reconnected", "addr", c.addr)
+			skipped = append(skipped, e)
+		default:
 			return nil
 		}
-		slog.Warn("registry pool conn reconnect failed", "attempt", attempts+1, "err", err)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
 	}
-	return fmt.Errorf("reconnect failed after 5 attempts: %w", err)
+	return nil
+}
+
+// releaseEntry returns an entry to the free list.
+func (c *Client) releaseEntry(e *pooledConn) {
+	select {
+	case c.pool.free <- e:
+	case <-c.doneCh():
+		// pool is torn down; drop the entry
+	}
+}
+
+// sendOnOtherEntry retries msg once on another idle, healthy entry.
+// served is false when no such entry is free or the retry also failed at
+// the connection level (that entry is then marked broken too).
+func (c *Client) sendOnOtherEntry(msg map[string]interface{}) (resp map[string]interface{}, served bool, err error) {
+	other := c.tryAcquireHealthy()
+	if other == nil {
+		return nil, false, nil
+	}
+	defer c.releaseEntry(other)
+	other.mu.Lock()
+	defer other.mu.Unlock()
+	resp, err = c.sendOnEntry(other, msg)
+	if err != nil && resp == nil {
+		return nil, false, nil
+	}
+	if err == nil {
+		c.reconn.servedByOther(c.logSummary)
+	}
+	return resp, true, err
+}
+
+// sendOnEntry writes the request and reads the response on entry.conn.
+// Caller must hold entry.mu. A connection-level failure (no response)
+// marks the entry broken and retires its conn.
+func (c *Client) sendOnEntry(entry *pooledConn, msg map[string]interface{}) (map[string]interface{}, error) {
+	resp, err := roundTrip(entry.conn, msg)
+	if err != nil && resp == nil {
+		entry.broken = err
+		if !c.isClosed() {
+			c.noteConnError(err, time.Since(entry.dialedAt))
+		}
+		c.retireEntryConn(entry)
+		return nil, err
+	}
+	c.reconn.healthy(time.Since(entry.dialedAt))
+	return resp, err
+}
+
+// retireEntryConn closes a dropped entry's conn right away (rather than
+// holding the fd until the entry is next used) and clears it, so Close
+// never closes it a second time. Once Close has started, the conn belongs
+// to Close and is left alone. Caller must hold entry.mu.
+func (c *Client) retireEntryConn(entry *pooledConn) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	old := entry.conn
+	entry.conn = nil
+	if entry == c.pool.entries[0] {
+		c.conn = nil
+	}
+	c.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+}
+
+// reconnectEntry redials a single pool entry after cause broke it (cause
+// may be nil). Caller must hold entry.mu. This is the per-entry analogue
+// of Client.reconnect.
+func (c *Client) reconnectEntry(ctx context.Context, entry *pooledConn, cause error) error {
+	if c.isClosed() {
+		return ErrClosed
+	}
+	c.retireEntryConn(entry)
+
+	conn, err := c.dialWithBackoff(ctx, "registry pool conn", cause)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.closed {
+		// Close ran while we were dialing and has already closed every
+		// conn it could see; this one is ours to close.
+		c.mu.Unlock()
+		conn.Close()
+		return ErrClosed
+	}
+	entry.conn = conn
+	// Keep c.conn (primary) in sync if this is the primary entry.
+	// Tests in this package read c.conn directly, so we must not
+	// leave it pointing at a closed fd.
+	if entry == c.pool.entries[0] {
+		c.conn = conn
+		c.connDialedAt = time.Now()
+	}
+	c.mu.Unlock()
+	entry.dialedAt = time.Now()
+	entry.broken = nil
+	c.noteReconnected("registry pool conn", cause)
+	return nil
 }
 
 // isClosed returns whether Close has been called. Cheap, lock-protected.
@@ -530,12 +801,22 @@ func (c *Client) isClosed() bool {
 
 // sendLocked sends a message and reads the response. Must be called with c.mu held.
 func (c *Client) sendLocked(msg map[string]interface{}) (map[string]interface{}, error) {
-	if err := wire.WriteMessage(c.conn, msg); err != nil {
+	return roundTrip(c.conn, msg)
+}
+
+// roundTrip writes msg on conn and reads the response. A nil response
+// with a non-nil error is a connection-level failure; a non-nil response
+// with an error is the registry's error reply.
+func roundTrip(conn net.Conn, msg map[string]interface{}) (map[string]interface{}, error) {
+	if conn == nil {
+		return nil, errNotConnected
+	}
+	if err := wire.WriteMessage(conn, msg); err != nil {
 		return nil, fmt.Errorf("send: %w", err)
 	}
-	c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	resp, err := wire.ReadMessage(c.conn)
-	c.conn.SetReadDeadline(time.Time{})
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	resp, err := wire.ReadMessage(conn)
+	conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		return nil, fmt.Errorf("recv: %w", err)
 	}

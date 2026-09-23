@@ -480,7 +480,11 @@ func TestPoolReconnectTLSThroughProxy(t *testing.T) {
 	}
 	defer c.Close()
 	// reconnectEntry redials only the broken entry, through the proxy.
+	// Hold the other entry so the dropped request cannot be served by it
+	// and must redial.
+	release := holdIdleEntries(t, c, 1)
 	mustSendOK(t, c, "drop")
+	release()
 	mustSendOK(t, c, "after")
 	assertConnects(t, proxy, srv, 3)
 	if got := srv.conns.Load(); got != 3 {
@@ -579,7 +583,9 @@ func TestWithDialerReceivesUnresolvedAddrAndBoundedContext(t *testing.T) {
 		t.Fatalf("DialPool: %v", err)
 	}
 	defer c.Close()
+	release := holdIdleEntries(t, c, 1) // force the redial path
 	mustSendOK(t, c, "drop")
+	release()
 	if got := calls.Load(); got != 3 {
 		t.Fatalf("dialer called %d times, want 3 (2 pool conns + 1 reconnect)", got)
 	}

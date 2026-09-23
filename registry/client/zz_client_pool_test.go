@@ -480,7 +480,7 @@ func TestReconnectEntrySyncsPrimary(t *testing.T) {
 	oldConn := c.conn
 	primary.mu.Lock()
 	_ = primary.conn.Close()
-	if err := c.reconnectEntry(context.Background(), primary); err != nil {
+	if err := c.reconnectEntry(context.Background(), primary, nil); err != nil {
 		primary.mu.Unlock()
 		t.Fatalf("reconnectEntry: %v", err)
 	}
@@ -515,7 +515,7 @@ func TestReconnectEntryFailsWhenClosed(t *testing.T) {
 	}
 	c.Close()
 
-	if err := c.reconnectEntry(context.Background(), c.pool.entries[0]); err == nil {
+	if err := c.reconnectEntry(context.Background(), c.pool.entries[0], nil); err == nil {
 		t.Fatalf("reconnectEntry on closed client should fail")
 	}
 }

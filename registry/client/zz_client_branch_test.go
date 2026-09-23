@@ -279,7 +279,7 @@ func TestBinaryReconnectShortCircuitsWhenClosed(t *testing.T) {
 	c.mu.Lock()
 	_ = c.conn.Close()
 	c.closed = true
-	err = c.reconnect()
+	err = c.reconnect(nil)
 	c.mu.Unlock()
 	if err == nil {
 		t.Fatalf("reconnect after Close should fail")
@@ -354,7 +354,7 @@ func TestClientReconnectExhaustsAttempts(t *testing.T) {
 
 	c := &Client{addr: addr}
 	c.mu.Lock()
-	err := c.reconnect(context.Background())
+	err := c.reconnect(context.Background(), nil)
 	c.mu.Unlock()
 	if err == nil {
 		t.Fatalf("expected reconnect failure")
