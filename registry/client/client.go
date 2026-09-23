@@ -412,12 +412,16 @@ func (c *Client) logSummary(attrs []any) {
 	c.log().Info("registry reconnect summary", append([]any{"addr", c.addr}, attrs...)...)
 }
 
-// noteConnError records a connection-level request failure (the triggering
-// error of the reconnect that follows) and logs it at Debug.
-func (c *Client) noteConnError(err error, age time.Duration) {
-	rapid := c.reconn.connError(err, age, c.logSummary)
+// noteConnError records a connection-level failure of one transmission (the
+// triggering error of the reconnect that follows) and logs it at Debug. A
+// logical request extends the rapid-close backoff streak at most once:
+// streakNoted says whether an earlier transmission of it already did, and
+// the result says whether one has now.
+func (c *Client) noteConnError(err error, age time.Duration, streakNoted bool) bool {
+	rapid := c.reconn.connError(err, age, !streakNoted, c.logSummary)
 	c.log().Debug("registry conn dropped", "addr", c.addr, "err", err,
 		"conn_age", age.Round(time.Millisecond).String(), "rapid_close", rapid)
+	return streakNoted || rapid
 }
 
 // dialWithBackoff opens a replacement connection after cause broke the old
@@ -429,6 +433,12 @@ func (c *Client) noteConnError(err error, age time.Duration) {
 //
 // It takes no lock, so the single-conn path may call it with c.mu held.
 func (c *Client) dialWithBackoff(ctx context.Context, what string, cause error) (net.Conn, error) {
+	// A caller that has given up (for example while the request was being
+	// retried on another pooled conn) gets no redial, and its abandoned
+	// dials are not counted against the registry.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := sleepCtx(ctx, c.doneCh(), c.reconn.cooldown()); err != nil {
 		return nil, err
 	}
@@ -443,6 +453,9 @@ func (c *Client) dialWithBackoff(ctx context.Context, what string, cause error) 
 		conn, err = dialConn(ctx, c.dial, c.addr, c.tlsConfig)
 		if err == nil {
 			return conn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		c.log().Warn(what+" reconnect failed", "addr", c.addr, "attempt", attempt, "err", err, "cause", errText(cause))
 		c.reconn.dialFailed(c.logSummary)
@@ -529,12 +542,28 @@ func (c *Client) Send(msg map[string]interface{}) (map[string]interface{}, error
 // SendContext sends a registry message with context propagation through
 // reconnect retries. Callers should pass a context with deadline or
 // cancellation (e.g. daemon shutdown context) so that reconnect backoff
-// does not block graceful stop.
+// does not block graceful stop. ctx bounds the wait for a free pooled
+// connection, the retry on another pooled connection and the reconnect;
+// it does not interrupt a round trip on the request's own connection,
+// which the 30 s read deadline bounds.
 //
-// A connection-level failure (no response) is retried once: on a pooled
-// client first on another idle, healthy connection, then after redialing.
-// An error response from the registry is returned as is, never retried.
-// After Close every call returns an error matching ErrClosed.
+// A connection-level failure (no response) is retried:
+//   - On a single-connection client the connection is redialed and the
+//     request sent once more, so it reaches the registry at most twice.
+//   - On a pooled client, when the connection was dropped (EOF, reset,
+//     closed) the request is first retried on another idle, healthy
+//     pooled connection, bounded by a short deadline and ctx. Only if that
+//     fails too is the request's own connection redialed and the request
+//     sent a third time. Other connection-level failures (timeouts) go
+//     straight to the redial.
+//
+// So a request whose connections drop may reach the registry more than
+// once (up to three times on a pooled client); an operation that is not
+// safe to repeat may have been applied even when an error is returned.
+// However many attempts fail, one request extends the rapid-close backoff
+// streak at most once. An error response from the registry is returned as
+// is, never retried. After Close every call returns an error matching
+// ErrClosed.
 func (c *Client) SendContext(ctx context.Context, msg map[string]interface{}) (map[string]interface{}, error) {
 	// Nil receiver — return a sentinel rather than panicking. Every
 	// exported wrapper method (Register, Lookup, Resolve, …) funnels
@@ -566,7 +595,7 @@ func (c *Client) SendContext(ctx context.Context, msg map[string]interface{}) (m
 			return nil, closedDuring(err)
 		}
 		cause := err
-		c.noteConnError(cause, time.Since(c.connDialedAt))
+		c.noteConnError(cause, time.Since(c.connDialedAt), false)
 		if reconnErr := c.reconnect(ctx, cause); reconnErr != nil {
 			return nil, reconnectFailed(cause, reconnErr)
 		}
@@ -607,7 +636,8 @@ func (c *Client) sendPool(ctx context.Context, msg map[string]interface{}) (map[
 		}
 	}
 
-	resp, err := c.sendOnEntry(entry, msg)
+	var st sendState
+	resp, err := c.sendOnEntry(entry, msg, &st)
 	if err == nil || resp != nil {
 		return resp, err
 	}
@@ -619,10 +649,12 @@ func (c *Client) sendPool(ctx context.Context, msg map[string]interface{}) (map[
 	// The connection was dropped (EOF, reset, closed). The other entries
 	// were dialed at other times and may still be good, so retry once on
 	// an idle healthy one before paying for a redial and any cooldown.
-	// Timeouts are not retried this way: a half-open conn already cost
-	// the caller the full read deadline.
+	// That retry is bounded by otherConnTimeout and ctx: the other conn
+	// may be silently hung, and the redial below must still fit in the
+	// caller's deadline. Timeouts are not retried this way: a half-open
+	// conn already cost the caller the full read deadline.
 	if isConnDropped(cause) {
-		if resp, served, err := c.sendOnOtherEntry(msg); served {
+		if resp, served, err := c.sendOnOtherEntry(ctx, msg, &st); served {
 			return resp, err
 		}
 		if c.isClosed() {
@@ -630,11 +662,12 @@ func (c *Client) sendPool(ctx context.Context, msg map[string]interface{}) (map[
 		}
 	}
 
-	// Redial this entry and retry once.
+	// Redial this entry and retry once. dialWithBackoff gives up at once
+	// when ctx ended during the retry above.
 	if rerr := c.reconnectEntry(ctx, entry, cause); rerr != nil {
 		return nil, reconnectFailed(cause, rerr)
 	}
-	resp, err = c.sendOnEntry(entry, msg)
+	resp, err = c.sendOnEntry(entry, msg, &st)
 	if err != nil && resp == nil {
 		if c.isClosed() {
 			return nil, closedDuring(err)
@@ -697,10 +730,23 @@ func (c *Client) releaseEntry(e *pooledConn) {
 	}
 }
 
-// sendOnOtherEntry retries msg once on another idle, healthy entry.
-// served is false when no such entry is free or the retry also failed at
-// the connection level (that entry is then marked broken too).
-func (c *Client) sendOnOtherEntry(msg map[string]interface{}) (resp map[string]interface{}, served bool, err error) {
+// sendState is the bookkeeping of one logical request across its attempts
+// on a pooled client.
+type sendState struct {
+	// streakNoted is set once a failed attempt of the request extended the
+	// rapid-close streak; later failures only feed the summary.
+	streakNoted bool
+}
+
+// sendOnOtherEntry retries msg once on another idle, healthy entry, with
+// the exchange bounded by otherConnTimeout and ctx. served is false when
+// no such entry is free or the retry also failed at the connection level,
+// timed out or was abandoned for ctx (that entry is then marked broken and
+// its conn retired, since a late reply could still arrive on it).
+func (c *Client) sendOnOtherEntry(ctx context.Context, msg map[string]interface{}, st *sendState) (resp map[string]interface{}, served bool, err error) {
+	if ctx.Err() != nil {
+		return nil, false, nil
+	}
 	other := c.tryAcquireHealthy()
 	if other == nil {
 		return nil, false, nil
@@ -708,7 +754,8 @@ func (c *Client) sendOnOtherEntry(msg map[string]interface{}) (resp map[string]i
 	defer c.releaseEntry(other)
 	other.mu.Lock()
 	defer other.mu.Unlock()
-	resp, err = c.sendOnEntry(other, msg)
+	resp, err = boundedRoundTrip(ctx, other.conn, msg, c.reconn.pol().otherConnTimeout)
+	resp, err = c.entryResult(other, st, resp, err)
 	if err != nil && resp == nil {
 		return nil, false, nil
 	}
@@ -721,12 +768,20 @@ func (c *Client) sendOnOtherEntry(msg map[string]interface{}) (resp map[string]i
 // sendOnEntry writes the request and reads the response on entry.conn.
 // Caller must hold entry.mu. A connection-level failure (no response)
 // marks the entry broken and retires its conn.
-func (c *Client) sendOnEntry(entry *pooledConn, msg map[string]interface{}) (map[string]interface{}, error) {
+func (c *Client) sendOnEntry(entry *pooledConn, msg map[string]interface{}, st *sendState) (map[string]interface{}, error) {
 	resp, err := roundTrip(entry.conn, msg)
+	return c.entryResult(entry, st, resp, err)
+}
+
+// entryResult records the outcome of one attempt on entry: a
+// connection-level failure (no response) marks the entry broken and
+// retires its conn; a response counts toward the rapid-close streak reset.
+// Caller must hold entry.mu.
+func (c *Client) entryResult(entry *pooledConn, st *sendState, resp map[string]interface{}, err error) (map[string]interface{}, error) {
 	if err != nil && resp == nil {
 		entry.broken = err
 		if !c.isClosed() {
-			c.noteConnError(err, time.Since(entry.dialedAt))
+			st.streakNoted = c.noteConnError(err, time.Since(entry.dialedAt), st.streakNoted)
 		}
 		c.retireEntryConn(entry)
 		return nil, err
@@ -817,6 +872,56 @@ func roundTrip(conn net.Conn, msg map[string]interface{}) (map[string]interface{
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	resp, err := wire.ReadMessage(conn)
 	conn.SetReadDeadline(time.Time{})
+	return checkResponse(resp, err)
+}
+
+// boundedRoundTrip is roundTrip with the whole exchange (write and read)
+// limited to timeout and to ctx, both its deadline and its cancellation.
+// When it gives up, the request may still be answered later on conn, so
+// the caller must retire the conn.
+func boundedRoundTrip(ctx context.Context, conn net.Conn, msg map[string]interface{}, timeout time.Duration) (map[string]interface{}, error) {
+	if conn == nil {
+		return nil, errNotConnected
+	}
+	deadline := time.Now().Add(timeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	conn.SetDeadline(deadline)
+	// Cancelling ctx interrupts the exchange by pulling the deadline in.
+	// The watcher is joined before the deadline is cleared, so a
+	// cancellation that races the end of the exchange cannot leave a
+	// deadline on a conn that goes back to the pool.
+	finished := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			conn.SetDeadline(time.Now())
+		case <-finished:
+		}
+	}()
+	var resp map[string]interface{}
+	err := wire.WriteMessage(conn, msg)
+	if err != nil {
+		err = fmt.Errorf("send: %w", err)
+	} else {
+		resp, err = checkResponse(wire.ReadMessage(conn))
+	}
+	close(finished)
+	<-watcherDone
+	conn.SetDeadline(time.Time{})
+	if err != nil && resp == nil && ctx.Err() != nil {
+		err = fmt.Errorf("%w (%w)", err, ctx.Err())
+	}
+	return resp, err
+}
+
+// checkResponse turns the result of reading one response frame into
+// roundTrip's result: a read error is a connection-level failure (nil
+// response); an error reply or a malformed one keeps the response.
+func checkResponse(resp map[string]interface{}, err error) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("recv: %w", err)
 	}

@@ -85,6 +85,13 @@ type reconnectPolicy struct {
 	quietReset time.Duration
 	// summaryEvery is the minimum interval between INFO summaries.
 	summaryEvery time.Duration
+	// otherConnTimeout bounds the whole exchange (write and read) of the
+	// retry on another pooled connection after a drop. Nothing shows that
+	// connection is still alive, and the request has already failed once,
+	// so it gets far less than the 30 s read deadline: a silently hung
+	// connection is retired after this long and the request falls back to
+	// a redial. The caller's ctx can end the retry sooner.
+	otherConnTimeout time.Duration
 }
 
 var defaultReconnectPolicy = reconnectPolicy{
@@ -97,6 +104,10 @@ var defaultReconnectPolicy = reconnectPolicy{
 	rapidWindow:  30 * time.Second,
 	quietReset:   time.Minute,
 	summaryEvery: time.Minute,
+	// Together with cooldownMax this stays well below the daemon's 8 s
+	// deadline, leaving room for the redial and the final attempt, while
+	// being several registry round trips long.
+	otherConnTimeout: 2 * time.Second,
 }
 
 // jitter returns a random duration in [d/2, d] ("equal jitter"), so clients
@@ -175,9 +186,14 @@ func (t *reconnectTracker) countedLocked(now time.Time, emit func([]any)) {
 	})
 }
 
-// connError records a connection-level request failure on a connection of
-// the given age and reports whether it is a rapid close.
-func (t *reconnectTracker) connError(err error, age time.Duration, emit func([]any)) (rapid bool) {
+// connError records a connection-level failure of one transmission on a
+// connection of the given age and reports whether it is a rapid close.
+// Every rapid close is counted in the summary, but it extends the backoff
+// streak only when extendStreak is set: the caller passes false once an
+// earlier transmission of the same logical request already did, so one
+// shed request grows the cooldown by one step however many connections it
+// was tried on.
+func (t *reconnectTracker) connError(err error, age time.Duration, extendStreak bool, emit func([]any)) (rapid bool) {
 	p := t.pol()
 	rapid = isPeerClose(err) && age > 0 && age < p.rapidWindow
 	now := time.Now()
@@ -185,11 +201,13 @@ func (t *reconnectTracker) connError(err error, age time.Duration, emit func([]a
 	defer t.mu.Unlock()
 	t.stats.lastCause = err.Error()
 	if rapid {
-		t.quietResetLocked(now, p)
-		t.rapidStreak++
 		t.stats.rapidCloses++
-		t.lastEvent = now
 		t.countedLocked(now, emit)
+		if extendStreak {
+			t.quietResetLocked(now, p)
+			t.rapidStreak++
+			t.lastEvent = now
+		}
 	}
 	return rapid
 }
