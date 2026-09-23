@@ -22,12 +22,16 @@ type BinaryClient struct {
 	mu     sync.Mutex
 	addr   string
 	closed bool
+	dial   DialContextFunc // optional; see WithDialer
 }
 
 // DialBinary connects to a registry server and negotiates the binary wire protocol.
 // The server detects the magic bytes and switches to binary mode for this connection.
-func DialBinary(addr string) (*BinaryClient, error) {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+// Pass WithDialer to route the connection (and every reconnect) through a
+// custom dialer such as an HTTP CONNECT proxy.
+func DialBinary(addr string, opts ...DialOption) (*BinaryClient, error) {
+	o := applyDialOptions(opts)
+	conn, err := dialConn(context.Background(), o.dial, addr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry: %w", err)
 	}
@@ -41,7 +45,7 @@ func DialBinary(addr string) (*BinaryClient, error) {
 		return nil, fmt.Errorf("binary handshake: %w", err)
 	}
 
-	return &BinaryClient{conn: conn, addr: addr}, nil
+	return &BinaryClient{conn: conn, addr: addr, dial: o.dial}, nil
 }
 
 // Close shuts down the binary client connection.
@@ -75,9 +79,7 @@ func (c *BinaryClient) reconnect() error {
 	var lastErr error
 
 	for attempts := 0; attempts < 5; attempts++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.addr)
-		cancel()
+		conn, err := dialConn(context.Background(), c.dial, c.addr, nil)
 		if err != nil {
 			lastErr = err
 			slog.Warn("binary client reconnect failed", "attempt", attempts+1, "err", err)
