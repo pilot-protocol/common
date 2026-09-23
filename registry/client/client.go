@@ -52,6 +52,10 @@ const dialTimeout = 5 * time.Second
 // conn is in use), eliminating the head-of-line wait. The primary
 // c.conn / c.mu / c.closed fields are retained for backward compatibility
 // with tests that touch them directly.
+//
+// Every Dial* constructor accepts DialOptions; WithDialer routes all of the
+// client's connections (initial, pool and reconnect) through a custom
+// dialer, e.g. an HTTP CONNECT proxy from the netproxy package.
 type Client struct {
 	// Primary connection. Always present; tests in this package read
 	// c.conn / c.mu / c.closed directly so the field set must stay stable.
@@ -61,6 +65,10 @@ type Client struct {
 	closed    bool
 	tlsConfig *tls.Config
 	signer    func(challenge string) string // H3 fix: optional message signer
+	// dial, when non-nil, opens every connection (initial, pool, reconnect)
+	// instead of a direct net.Dialer — see WithDialer. Immutable after
+	// construction.
+	dial DialContextFunc
 
 	// Optional pool of secondary connections used to parallelise Send.
 	// nil / empty when DialPool was not used.
@@ -131,12 +139,16 @@ func (c *Client) sign(challenge string) (string, error) {
 	return sig, nil
 }
 
-func Dial(addr string) (*Client, error) {
-	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+// Dial connects to a registry server over plain TCP. Pass WithDialer to
+// route the connection (and every reconnect) through a custom dialer such
+// as an HTTP CONNECT proxy.
+func Dial(addr string, opts ...DialOption) (*Client, error) {
+	o := applyDialOptions(opts)
+	conn, err := dialConn(context.Background(), o.dial, addr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry: %w", err)
 	}
-	return &Client{conn: conn, addr: addr}, nil
+	return &Client{conn: conn, addr: addr, dial: o.dial}, nil
 }
 
 // DialPool connects to a registry server over plain TCP and pre-warms a
@@ -153,15 +165,16 @@ func Dial(addr string) (*Client, error) {
 //
 // On any pool conn dial failure DialPool closes the conns it had already
 // opened and returns an error.
-func DialPool(addr string, size int) (*Client, error) {
+func DialPool(addr string, size int, opts ...DialOption) (*Client, error) {
 	if size <= 0 {
 		size = 1
 	}
-	primary, err := net.DialTimeout("tcp", addr, dialTimeout)
+	o := applyDialOptions(opts)
+	primary, err := dialConn(context.Background(), o.dial, addr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry: %w", err)
 	}
-	c := &Client{conn: primary, addr: addr}
+	c := &Client{conn: primary, addr: addr, dial: o.dial}
 	if err := c.initPool(size, nil); err != nil {
 		primary.Close()
 		return nil, err
@@ -171,30 +184,35 @@ func DialPool(addr string, size int) (*Client, error) {
 
 // DialTLS connects to a registry server over TLS.
 // A non-nil tlsConfig is required. For certificate pinning, use DialTLSPinned.
-func DialTLS(addr string, tlsConfig *tls.Config) (*Client, error) {
+func DialTLS(addr string, tlsConfig *tls.Config, opts ...DialOption) (*Client, error) {
 	if tlsConfig == nil {
 		return nil, fmt.Errorf("TLS config required; use DialTLSPinned for certificate pinning")
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsConfig)
+	o := applyDialOptions(opts)
+	conn, err := dialConn(context.Background(), o.dial, addr, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("dial registry TLS: %w", err)
 	}
-	return &Client{conn: conn, addr: addr, tlsConfig: tlsConfig}, nil
+	return &Client{conn: conn, addr: addr, tlsConfig: tlsConfig, dial: o.dial}, nil
 }
 
 // DialTLSPool is the TLS variant of DialPool.
-func DialTLSPool(addr string, tlsConfig *tls.Config, size int) (*Client, error) {
+func DialTLSPool(addr string, tlsConfig *tls.Config, size int, opts ...DialOption) (*Client, error) {
 	if tlsConfig == nil {
 		return nil, fmt.Errorf("TLS config required; use DialTLSPinnedPool for certificate pinning")
 	}
+	return dialTLSPool(addr, tlsConfig, size, "dial registry TLS", applyDialOptions(opts))
+}
+
+func dialTLSPool(addr string, tlsConfig *tls.Config, size int, errPrefix string, o dialOptions) (*Client, error) {
 	if size <= 0 {
 		size = 1
 	}
-	primary, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsConfig)
+	primary, err := dialConn(context.Background(), o.dial, addr, tlsConfig)
 	if err != nil {
-		return nil, fmt.Errorf("dial registry TLS: %w", err)
+		return nil, fmt.Errorf("%s: %w", errPrefix, err)
 	}
-	c := &Client{conn: primary, addr: addr, tlsConfig: tlsConfig}
+	c := &Client{conn: primary, addr: addr, tlsConfig: tlsConfig, dial: o.dial}
 	if err := c.initPool(size, tlsConfig); err != nil {
 		primary.Close()
 		return nil, err
@@ -204,7 +222,8 @@ func DialTLSPool(addr string, tlsConfig *tls.Config, size int) (*Client, error) 
 
 // initPool dials size-1 additional connections and registers them in c.pool.
 // It assumes c.conn (primary) is already set. tlsCfg, when non-nil, is used
-// for TLS dialing; otherwise plain TCP.
+// for TLS dialing; otherwise plain TCP. Every conn goes through c.dial when
+// one is configured.
 func (c *Client) initPool(size int, tlsCfg *tls.Config) error {
 	if size <= 1 {
 		// No secondary conns — single-conn legacy path; pool stays empty.
@@ -213,13 +232,7 @@ func (c *Client) initPool(size int, tlsCfg *tls.Config) error {
 	entries := make([]*pooledConn, 0, size)
 	entries = append(entries, &pooledConn{conn: c.conn})
 	for i := 1; i < size; i++ {
-		var conn net.Conn
-		var err error
-		if tlsCfg != nil {
-			conn, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", c.addr, tlsCfg)
-		} else {
-			conn, err = net.DialTimeout("tcp", c.addr, dialTimeout)
-		}
+		conn, err := dialConn(context.Background(), c.dial, c.addr, tlsCfg)
 		if err != nil {
 			// Close any conns we already opened (excluding primary —
 			// caller closes that on failure).
@@ -242,8 +255,25 @@ func (c *Client) initPool(size int, tlsCfg *tls.Config) error {
 
 // DialTLSPinned connects to a registry server over TLS with certificate pinning.
 // The fingerprint is a hex-encoded SHA-256 hash of the server's DER-encoded certificate.
-func DialTLSPinned(addr, fingerprint string) (*Client, error) {
-	tlsConfig := &tls.Config{
+func DialTLSPinned(addr, fingerprint string, opts ...DialOption) (*Client, error) {
+	o := applyDialOptions(opts)
+	tlsConfig := pinnedTLSConfig(fingerprint)
+	conn, err := dialConn(context.Background(), o.dial, addr, tlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("dial registry TLS pinned: %w", err)
+	}
+	return &Client{conn: conn, addr: addr, tlsConfig: tlsConfig, dial: o.dial}, nil
+}
+
+// DialTLSPinnedPool is the pooled variant of DialTLSPinned (see DialPool).
+func DialTLSPinnedPool(addr, fingerprint string, size int, opts ...DialOption) (*Client, error) {
+	return dialTLSPool(addr, pinnedTLSConfig(fingerprint), size, "dial registry TLS pinned", applyDialOptions(opts))
+}
+
+// pinnedTLSConfig accepts exactly the server certificate whose DER SHA-256
+// is the hex fingerprint, instead of verifying a CA chain.
+func pinnedTLSConfig(fingerprint string) *tls.Config {
+	return &tls.Config{
 		// InsecureSkipVerify disables the default CA chain check so we can
 		// use VerifyPeerCertificate for certificate pinning (SHA-256 fingerprint).
 		// This is the standard Go pattern — the custom callback below provides
@@ -261,11 +291,6 @@ func DialTLSPinned(addr, fingerprint string) (*Client, error) {
 			return nil
 		},
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("dial registry TLS pinned: %w", err)
-	}
-	return &Client{conn: conn, addr: addr, tlsConfig: tlsConfig}, nil
 }
 
 func (c *Client) Close() error {
@@ -327,12 +352,7 @@ func (c *Client) reconnect(ctx context.Context) error {
 	maxBackoff := 10 * time.Second
 
 	for attempts := 0; attempts < 5; attempts++ {
-		if c.tlsConfig != nil {
-			dialer := &tls.Dialer{Config: c.tlsConfig, NetDialer: &net.Dialer{Timeout: 5 * time.Second}}
-			conn, err = dialer.DialContext(ctx, "tcp", c.addr)
-		} else {
-			conn, err = net.DialTimeout("tcp", c.addr, 5*time.Second)
-		}
+		conn, err = dialConn(ctx, c.dial, c.addr, c.tlsConfig)
 		if err == nil {
 			c.conn = conn
 			slog.Info("registry reconnected", "addr", c.addr)
@@ -473,12 +493,7 @@ func (c *Client) reconnectEntry(ctx context.Context, entry *pooledConn) error {
 	backoff := 500 * time.Millisecond
 	maxBackoff := 10 * time.Second
 	for attempts := 0; attempts < 5; attempts++ {
-		if c.tlsConfig != nil {
-			dialer := &tls.Dialer{Config: c.tlsConfig, NetDialer: &net.Dialer{Timeout: 5 * time.Second}}
-			conn, err = dialer.DialContext(ctx, "tcp", c.addr)
-		} else {
-			conn, err = net.DialTimeout("tcp", c.addr, 5*time.Second)
-		}
+		conn, err = dialConn(ctx, c.dial, c.addr, c.tlsConfig)
 		if err == nil {
 			entry.conn = conn
 			// Keep c.conn (primary) in sync if this is the primary entry.
