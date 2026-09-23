@@ -528,3 +528,67 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// The Muse shape end to end: a valid HTTPS_PROXY whose credentials hold
+// unescaped '/', '?' and '#', next to an HTTP_PROXY Go cannot use. The
+// registry dial must still tunnel through the proxy with the right
+// Proxy-Authorization, only the real proxy address may be dialed (no DNS
+// lookup of a credential fragment), and a failed dial must not echo the
+// secret.
+func TestDialerUnescapedCredentialsBesideUnusableHTTPProxy(t *testing.T) {
+	t.Parallel()
+	const user, pass = "tok/en?x", "pa#ss/w?rd"
+	echoIP, echoPort := newEchoServer(t)
+	proxy := newTestProxy(t, map[string]string{echoHost: echoIP}, withAuth(user, pass))
+	r, err := fromEnv(envMap(map[string]string{
+		"HTTPS_PROXY": "http://" + user + ":" + pass + "@" + proxy.addr(),
+		"http_proxy":  "socks5h://127.0.0.1:1080",
+	}))
+	if err != nil {
+		t.Fatalf("fromEnv: %v", err)
+	}
+	if len(r.Warnings()) != 1 {
+		t.Fatalf("Warnings() = %v", r.Warnings())
+	}
+	fwd := &recordingForward{}
+	d := &Dialer{Resolver: r, Forward: fwd.dial}
+	target := net.JoinHostPort(echoHost, echoPort)
+	c, err := d.DialContext(context.Background(), "tcp", target)
+	if err != nil {
+		t.Fatalf("dial through proxy: %v", err)
+	}
+	roundTrip(t, c, "muse")
+	c.Close()
+	targets, _, auths := proxy.seen()
+	if len(targets) != 1 || targets[0] != target || auths[0] != basicAuth(user, pass) {
+		t.Fatalf("proxy saw targets %q auths %q", targets, auths)
+	}
+	if got := fwd.seen(); len(got) != 1 || got[0] != proxy.addr() {
+		t.Fatalf("dialed %q, want only the proxy %s", got, proxy.addr())
+	}
+
+	// Same credentials, proxy down: the error names the real proxy only.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := ln.Addr().String()
+	ln.Close()
+	fwd = &recordingForward{}
+	d = &Dialer{Resolver: mustExplicit(t, "http://"+user+":"+pass+"@"+dead), Forward: fwd.dial}
+	_, err = d.DialContext(context.Background(), "tcp", "registry.pilot.invalid:443")
+	if err == nil {
+		t.Fatal("dial through a dead proxy succeeded")
+	}
+	for _, secret := range []string{"tok", "en?x", "pa#", "ss/w", "rd"} {
+		if strings.Contains(err.Error(), secret) || strings.Contains(d.Resolver.String(), secret) {
+			t.Fatalf("secret fragment %q leaked: err=%q resolver=%q", secret, err, d.Resolver)
+		}
+	}
+	if !strings.Contains(err.Error(), "http://***@"+dead) {
+		t.Fatalf("error should name the redacted real proxy: %q", err)
+	}
+	if got := fwd.seen(); len(got) != 1 || got[0] != dead {
+		t.Fatalf("dialed %q, want only %s", got, dead)
+	}
+}

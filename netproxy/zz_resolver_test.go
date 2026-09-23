@@ -3,6 +3,7 @@
 package netproxy
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -252,8 +253,257 @@ func TestParseErrorsNeverLeakCredentials(t *testing.T) {
 	if _, err := Explicit("   "); err == nil {
 		t.Fatal("empty explicit URL accepted")
 	}
-	if _, err := fromEnv(envMap(map[string]string{"HTTP_PROXY": "gopher://x:1"})); err == nil || !strings.HasPrefix(err.Error(), "HTTP_PROXY: ") {
-		t.Fatalf("bad HTTP_PROXY: %v", err)
+	// An unusable HTTP_PROXY is a warning, not an error (see
+	// TestFromEnvVariablesAreIndependent), and is just as tight-lipped.
+	r, err := fromEnv(envMap(map[string]string{"HTTP_PROXY": "gopher://user:hunter2@x:1"}))
+	if err != nil {
+		t.Fatalf("bad HTTP_PROXY failed the resolver: %v", err)
+	}
+	w := r.Warnings()
+	if len(w) != 1 || !strings.HasPrefix(w[0].Error(), "HTTP_PROXY: ") || strings.Contains(w[0].Error(), "hunter2") || strings.Contains(w[0].Error(), "user") {
+		t.Fatalf("bad HTTP_PROXY warning: %v", w)
+	}
+}
+
+// A proxy variable that cannot be used must not take down another one that
+// can: a Muse-style VM with a valid HTTPS_PROXY and an http_proxy that Go
+// cannot use still proxies registry traffic.
+func TestFromEnvVariablesAreIndependent(t *testing.T) {
+	t.Parallel()
+	const (
+		registry = "registry.pilotprotocol.network:443"
+		secure   = "http://u:p@egress:3128"
+	)
+	cases := []struct {
+		name       string
+		env        map[string]string
+		wantTLS    string   // proxy for registry and https:// requests
+		wantPlain  string   // proxy for http:// requests
+		wantWarned []string // variables reported by Warnings, in order
+	}{
+		{
+			name:       "socks HTTP_PROXY beside a valid HTTPS_PROXY",
+			env:        map[string]string{"HTTPS_PROXY": secure, "HTTP_PROXY": "socks5://proxy:1080"},
+			wantTLS:    secure,
+			wantPlain:  secure,
+			wantWarned: []string{"HTTP_PROXY"},
+		},
+		{
+			name:       "garbage http_proxy beside a valid https_proxy",
+			env:        map[string]string{"https_proxy": secure, "http_proxy": "garbage with space"},
+			wantTLS:    secure,
+			wantPlain:  secure,
+			wantWarned: []string{"http_proxy"},
+		},
+		{
+			name:       "unusable HTTP_PROXY falls through to http_proxy",
+			env:        map[string]string{"HTTPS_PROXY": secure, "HTTP_PROXY": "socks5h://x:1", "http_proxy": "http://plain:8080"},
+			wantTLS:    secure,
+			wantPlain:  "http://plain:8080",
+			wantWarned: []string{"HTTP_PROXY"},
+		},
+		{
+			name:       "socks ALL_PROXY alone is ignored",
+			env:        map[string]string{"ALL_PROXY": "socks5://127.0.0.1:1080"},
+			wantWarned: []string{"ALL_PROXY"},
+		},
+		{
+			name:       "unusable ALL_PROXY falls through to all_proxy",
+			env:        map[string]string{"ALL_PROXY": "socks5://127.0.0.1:1080", "all_proxy": secure},
+			wantTLS:    secure,
+			wantPlain:  secure,
+			wantWarned: []string{"ALL_PROXY"},
+		},
+		{
+			name:       "everything unusable except HTTPS_PROXY",
+			env:        map[string]string{"HTTPS_PROXY": secure, "ALL_PROXY": "socks5://a:1", "HTTP_PROXY": "http://bad port", "http_proxy": "ftp://c:21"},
+			wantTLS:    secure,
+			wantPlain:  secure,
+			wantWarned: []string{"HTTP_PROXY", "http_proxy"},
+		},
+	}
+	for _, tc := range cases {
+		r, err := fromEnv(envMap(tc.env))
+		if err != nil {
+			t.Fatalf("%s: fromEnv: %v", tc.name, err)
+		}
+		if r.Enabled() != (tc.wantTLS != "") {
+			t.Fatalf("%s: Enabled() = %v", tc.name, r.Enabled())
+		}
+		if got := proxyFor(t, r, registry); got != tc.wantTLS {
+			t.Fatalf("%s: registry proxy = %q, want %q", tc.name, got, tc.wantTLS)
+		}
+		if got := proxyForURL(t, r, "https://"+registry+"/"); got != tc.wantTLS {
+			t.Fatalf("%s: https proxy = %q, want %q", tc.name, got, tc.wantTLS)
+		}
+		if got := proxyForURL(t, r, "http://plain.pilot.invalid/"); got != tc.wantPlain {
+			t.Fatalf("%s: http proxy = %q, want %q", tc.name, got, tc.wantPlain)
+		}
+		var warned []string
+		for _, w := range r.Warnings() {
+			var ee *EnvError
+			if !errors.As(w, &ee) {
+				t.Fatalf("%s: warning %v is not an *EnvError", tc.name, w)
+			}
+			if !strings.HasPrefix(w.Error(), ee.Var+": netproxy: ") {
+				t.Fatalf("%s: warning %q does not name its variable", tc.name, w)
+			}
+			warned = append(warned, ee.Var)
+		}
+		if strings.Join(warned, ",") != strings.Join(tc.wantWarned, ",") {
+			t.Fatalf("%s: warned about %q, want %q", tc.name, warned, tc.wantWarned)
+		}
+		if s := r.String(); !strings.Contains(s, "(ignored unusable "+strings.Join(tc.wantWarned, ", ")+")") || strings.Contains(s, "u:p") {
+			t.Fatalf("%s: String() = %q", tc.name, s)
+		}
+	}
+
+	// Warnings are a copy, and absent for non-environment resolvers.
+	r, _ := fromEnv(envMap(map[string]string{"HTTP_PROXY": "socks5://x:1"}))
+	r.Warnings()[0] = nil
+	if r.Warnings()[0] == nil {
+		t.Fatal("Warnings exposed the resolver's slice")
+	}
+	var nilResolver *Resolver
+	for _, other := range []*Resolver{nilResolver, Off(), mustExplicit(t, secure)} {
+		if w := other.Warnings(); w != nil {
+			t.Fatalf("%s: Warnings() = %v", other, w)
+		}
+	}
+	if got := r.String(); got != "auto: no proxy in environment (ignored unusable HTTP_PROXY)" {
+		t.Fatalf("String() = %q", got)
+	}
+}
+
+// Only the variables that explicitly name the TLS proxy are fatal when
+// unusable; the error names the variable and withholds the value.
+func TestFromEnvUnusableTLSProxyIsAnError(t *testing.T) {
+	t.Parallel()
+	for _, env := range []map[string]string{
+		{"HTTPS_PROXY": "socks5://user:hunter2@a:1", "https_proxy": "http://ok:1", "HTTP_PROXY": "http://ok:1"},
+		{"https_proxy": "http://user:hunter2@a:bad", "ALL_PROXY": "http://ok:1"},
+	} {
+		_, err := fromEnv(envMap(env))
+		var ee *EnvError
+		if !errors.As(err, &ee) {
+			t.Fatalf("%v: err = %v, want *EnvError", env, err)
+		}
+		if _, set := env["HTTPS_PROXY"]; (set && ee.Var != "HTTPS_PROXY") || (!set && ee.Var != "https_proxy") {
+			t.Fatalf("%v: error names %q", env, ee.Var)
+		}
+		if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "user") {
+			t.Fatalf("%v: error leaks credentials: %v", env, err)
+		}
+	}
+}
+
+// Proxy credentials often hold unescaped '/', '?' or '#' (base64 tokens).
+// url.Parse ends the authority at the first of those, which would turn part
+// of the secret into the proxy host. The userinfo runs to the LAST '@', so
+// the credentials decode intact and never appear in String, Redact, errors
+// or a DNS lookup.
+func TestUnescapedDelimitersInUserinfo(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		raw, user, pass, host string
+		hasPass               bool
+		secrets               []string
+	}{
+		{"http://abcDEF/ghi+jkl@proxy.muse:3128", "abcDEF/ghi+jkl", "", "proxy.muse:3128", false, []string{"abcDEF", "ghi"}},
+		{"http://user:9876/zz@proxy:3128", "user", "9876/zz", "proxy:3128", true, []string{"user", "9876"}},
+		{"http://user:9876?zz@proxy:3128", "user", "9876?zz", "proxy:3128", true, []string{"user", "9876"}},
+		{"http://user:98#76@proxy:3128", "user", "98#76", "proxy:3128", true, []string{"user", "98"}},
+		{"http://AbC/dEf+ghi==@proxy:3128", "AbC/dEf+ghi==", "", "proxy:3128", false, []string{"AbC", "dEf"}},
+		{"https://tok:a/b?c#d@egress.internal", "tok", "a/b?c#d", "egress.internal", true, []string{"tok", "a/b"}},
+		{"user:pa/ss@proxy:3128", "user", "pa/ss", "proxy:3128", true, []string{"user", "pa/ss"}},
+		{"user:pa://ss@proxy:3128", "user", "pa://ss", "proxy:3128", true, []string{"user", "pa:"}},
+		{"http://us@er:p@ss@proxy:3128", "us@er", "p@ss", "proxy:3128", true, []string{"us@er", "p@ss"}},
+		{"http://u%2Fx:p%23w/q@proxy:3128/", "u/x", "p#w/q", "proxy:3128", true, []string{"u%2F", "p%23"}},
+	}
+	for _, tc := range cases {
+		explicit, err := Explicit(tc.raw)
+		if err != nil {
+			t.Fatalf("Explicit(%q): %v", tc.raw, err)
+		}
+		auto, err := fromEnv(envMap(map[string]string{"HTTPS_PROXY": tc.raw}))
+		if err != nil {
+			t.Fatalf("HTTPS_PROXY=%q: %v", tc.raw, err)
+		}
+		for _, r := range []*Resolver{explicit, auto} {
+			u, err := r.ProxyForAddr("registry.pilotprotocol.network:443")
+			if err != nil || u == nil {
+				t.Fatalf("%q: ProxyForAddr = %v, %v", tc.raw, u, err)
+			}
+			if u.Host != tc.host {
+				t.Fatalf("%q: proxy host %q, want %q", tc.raw, u.Host, tc.host)
+			}
+			pass, hasPass := u.User.Password()
+			if u.User.Username() != tc.user || pass != tc.pass || hasPass != tc.hasPass {
+				t.Fatalf("%q: userinfo %q/%q/%v, want %q/%q/%v", tc.raw, u.User.Username(), pass, hasPass, tc.user, tc.pass, tc.hasPass)
+			}
+			// The URL round-trips: what net/http reads back is the same.
+			if back, err := url.Parse(u.String()); err != nil || back.Host != tc.host || back.User.String() != u.User.String() {
+				t.Fatalf("%q: String() %q does not round-trip: %v", tc.raw, u.String(), err)
+			}
+			for _, logged := range []string{r.String(), Redact(u)} {
+				if !strings.Contains(logged, "***@"+tc.host) {
+					t.Fatalf("%q: logged form %q does not show the real host", tc.raw, logged)
+				}
+				for _, secret := range tc.secrets {
+					if strings.Contains(logged, secret) {
+						t.Fatalf("%q: logged form %q leaks %q", tc.raw, logged, secret)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Values that stay unusable are rejected without echoing any part of the
+// credentials, however the delimiters fall.
+func TestUnusableUserinfoNeverLeaks(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{
+		"http://se/cret:hunter2@proxy:bad-port",
+		"http://se?cret:hun#ter2@",
+		"http://se/cret:hun%zzter2@proxy:1",
+		"http://se/cret:hunter2\x7f@proxy:1",
+		"http://se/cret:hunter2@proxy%zz:1",
+		"secret://hunter2@proxy:1",
+		"socks5://se/cret:hunter2@proxy:1",
+	} {
+		_, err := Explicit(raw)
+		if err == nil {
+			t.Fatalf("Explicit(%q) accepted", raw)
+		}
+		for _, secret := range []string{"se/cret", "se?cret", "cret", "hunter2", "hun", "secret"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("Explicit(%q) error %q leaks %q", raw, err, secret)
+			}
+		}
+	}
+}
+
+func TestRedactMisparsedURL(t *testing.T) {
+	t.Parallel()
+	// URLs built by url.Parse from unescaped credentials: the secret sits
+	// in Host (and Path/Query/Fragment), the real host after the last '@'.
+	cases := map[string]string{
+		"http://abcDEF/ghi+jkl@proxy.muse:3128": "http://***@proxy.muse:3128",
+		"http://user:9876/zz@proxy:3128":        "http://***@proxy:3128",
+		"http://user:9876?zz@proxy:3128":        "http://***@proxy:3128",
+		"http://user:98#76@proxy:3128":          "http://***@proxy:3128",
+		"http://u@x/pa@ss@proxy:3128/":          "http://***@proxy:3128",
+		"http:user/pw@proxy:1":                  "http://***@proxy:1",
+	}
+	for in, want := range cases {
+		u, err := url.Parse(in)
+		if err != nil {
+			t.Fatalf("url.Parse(%q): %v", in, err)
+		}
+		if got := Redact(u); got != want {
+			t.Fatalf("Redact(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

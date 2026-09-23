@@ -64,7 +64,24 @@ type Resolver struct {
 	noProxy noProxy
 	// noProxyRaw is kept only for String().
 	noProxyRaw string
+	// warnings lists the proxy variables that were set but skipped because
+	// their values are unusable (*EnvError each).
+	warnings []error
 }
+
+// EnvError reports a proxy environment variable whose value cannot be used.
+// Its message names the variable and never includes the value's
+// credentials.
+type EnvError struct {
+	// Var is the environment variable, e.g. "HTTP_PROXY".
+	Var string
+	// Err says why the value is unusable.
+	Err error
+}
+
+func (e *EnvError) Error() string { return e.Var + ": " + e.Err.Error() }
+
+func (e *EnvError) Unwrap() error { return e.Err }
 
 // Off returns a Resolver that never uses a proxy.
 func Off() *Resolver { return &Resolver{mode: ModeOff} }
@@ -73,7 +90,8 @@ func Off() *Resolver { return &Resolver{mode: ModeOff} }
 // and anything NO_PROXY would exempt — through proxyURL. The URL must use
 // the http or https scheme ("http://[user:pass@]host[:port]"); a URL with no
 // scheme is taken as http. The port defaults to 80 for http and 443 for
-// https.
+// https. Everything up to the last "@" is the userinfo, so credentials may
+// hold unescaped '/', '?', '#' or '@'; percent-escapes in them are decoded.
 func Explicit(proxyURL string) (*Resolver, error) {
 	if strings.TrimSpace(proxyURL) == "" {
 		return nil, errors.New("netproxy: empty proxy URL")
@@ -89,49 +107,92 @@ func Explicit(proxyURL string) (*Resolver, error) {
 // conventional proxy environment variables, taken now:
 //
 //   - TLS and raw TCP targets (ProxyForAddr, and https:// / wss:// requests)
-//     use the first non-empty of HTTPS_PROXY, https_proxy, ALL_PROXY,
+//     use the first usable one of HTTPS_PROXY, https_proxy, ALL_PROXY,
 //     all_proxy.
-//   - Plain http:// / ws:// requests use HTTP_PROXY or http_proxy when set,
-//     and otherwise the same proxy as TLS targets. HTTP_PROXY (upper case) is
-//     ignored when REQUEST_METHOD is set, as net/http does, so a CGI request
-//     header cannot inject a proxy.
+//   - Plain http:// / ws:// requests use the first usable one of HTTP_PROXY,
+//     http_proxy, and otherwise the same proxy as TLS targets. HTTP_PROXY
+//     (upper case) is ignored when REQUEST_METHOD is set, as net/http does,
+//     so a CGI request header cannot inject a proxy.
 //   - NO_PROXY / no_proxy exempts targets: a comma- or space-separated list
 //     of host names (matching the name and its subdomains; a leading "." or
 //     "*." matches subdomains only), IP addresses, CIDR ranges, each
 //     optionally with ":port", or "*" for everything. localhost and loopback
 //     addresses are always exempt.
 //
-// An environment with no proxy variables yields a Resolver that never
-// proxies (Enabled reports false). A malformed proxy URL is an error that
-// never echoes the URL's credentials.
+// Each variable is parsed on its own, so one bad value never disables
+// another. A value is unusable when it is malformed or names a scheme other
+// than http or https (socks5://, for example). An unusable HTTP_PROXY,
+// http_proxy, ALL_PROXY or all_proxy is skipped (the next variable in its
+// list applies) and reported by Warnings. Only an unusable HTTPS_PROXY or
+// https_proxy, which explicitly names the TLS proxy, makes FromEnvironment
+// fail, with an *EnvError naming it.
+//
+// An environment with no usable proxy variables yields a Resolver that
+// never proxies (Enabled reports false). Neither errors nor warnings ever
+// echo a value's credentials.
 func FromEnvironment() (*Resolver, error) {
 	return fromEnv(os.Getenv)
 }
 
 func fromEnv(getenv func(string) string) (*Resolver, error) {
 	r := &Resolver{mode: ModeAuto}
-	secureRaw, secureVar := firstEnv(getenv, "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-	if secureRaw != "" {
-		u, err := parseProxyURL(secureRaw)
+	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
+		u, err := envProxy(getenv, name)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", secureVar, err)
+			if name == "HTTPS_PROXY" || name == "https_proxy" {
+				return nil, err
+			}
+			r.warnings = append(r.warnings, err)
+			continue
 		}
-		r.secure = u
+		if u != nil {
+			r.secure = u
+			break
+		}
 	}
 	plainVars := []string{"HTTP_PROXY", "http_proxy"}
 	if getenv("REQUEST_METHOD") != "" {
 		plainVars = plainVars[1:]
 	}
-	if plainRaw, plainVar := firstEnv(getenv, plainVars...); plainRaw != "" {
-		u, err := parseProxyURL(plainRaw)
+	for _, name := range plainVars {
+		u, err := envProxy(getenv, name)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", plainVar, err)
+			r.warnings = append(r.warnings, err)
+			continue
 		}
-		r.plain = u
+		if u != nil {
+			r.plain = u
+			break
+		}
 	}
 	r.noProxyRaw, _ = firstEnv(getenv, "NO_PROXY", "no_proxy")
 	r.noProxy = parseNoProxy(r.noProxyRaw)
 	return r, nil
+}
+
+// envProxy parses one proxy variable: nil, nil when it is unset or blank,
+// and an *EnvError when its value is unusable.
+func envProxy(getenv func(string) string, name string) (*url.URL, error) {
+	raw := strings.TrimSpace(getenv(name))
+	if raw == "" {
+		return nil, nil
+	}
+	u, err := parseProxyURL(raw)
+	if err != nil {
+		return nil, &EnvError{Var: name, Err: err}
+	}
+	return u, nil
+}
+
+// Warnings reports the proxy environment variables FromEnvironment skipped
+// because their values are unusable, one *EnvError per variable, in
+// precedence order. It is empty for other Resolvers. The messages are safe
+// to log.
+func (r *Resolver) Warnings() []error {
+	if r == nil || len(r.warnings) == 0 {
+		return nil
+	}
+	return append([]error(nil), r.warnings...)
 }
 
 // Parse builds a Resolver from a -proxy style setting: "auto" (or "") reads
@@ -183,7 +244,7 @@ func (r *Resolver) String() string {
 		return Redact(r.fixed)
 	case ModeAuto:
 		if !r.Enabled() {
-			return "auto: no proxy in environment"
+			return "auto: no proxy in environment" + r.ignoredSuffix()
 		}
 		s := "auto: " + Redact(r.secure)
 		if r.secure == nil {
@@ -194,9 +255,25 @@ func (r *Resolver) String() string {
 		if r.noProxyRaw != "" {
 			s += " (NO_PROXY=" + r.noProxyRaw + ")"
 		}
-		return s
+		return s + r.ignoredSuffix()
 	}
 	return ModeOff
+}
+
+// ignoredSuffix names the skipped variables for String, e.g.
+// " (ignored unusable HTTP_PROXY, ALL_PROXY)".
+func (r *Resolver) ignoredSuffix() string {
+	if len(r.warnings) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(r.warnings))
+	for _, w := range r.warnings {
+		var ee *EnvError
+		if errors.As(w, &ee) {
+			names = append(names, ee.Var)
+		}
+	}
+	return " (ignored unusable " + strings.Join(names, ", ") + ")"
 }
 
 // ProxyForAddr returns the proxy to tunnel a raw TCP (or TLS) connection to
@@ -260,6 +337,12 @@ func (r *Resolver) pick(host, port string, secure bool) *url.URL {
 // Redact renders a proxy URL for logging as scheme://host:port, replacing
 // any userinfo (user name and password alike) with "***" and dropping the
 // path, query and fragment. Redact(nil) is "".
+//
+// A URL with "@" in its path, query, fragment or opaque part is taken to be
+// a proxy URL whose credentials held an unescaped '/', '?' or '#', which
+// url.Parse splits so that part of the credentials lands in Host. Redact
+// then withholds everything before the last "@" and shows only what follows
+// it as the host.
 func Redact(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -269,6 +352,15 @@ func Redact(u *url.URL) string {
 		b.WriteString(u.Scheme)
 		b.WriteString("://")
 	}
+	if tail := u.Opaque + u.Path + "?" + u.RawQuery + "#" + u.Fragment; strings.Contains(tail, "@") {
+		host := tail[strings.LastIndex(tail, "@")+1:]
+		if i := strings.IndexAny(host, "/?#"); i >= 0 {
+			host = host[:i]
+		}
+		b.WriteString("***@")
+		b.WriteString(host)
+		return b.String()
+	}
 	if u.User != nil {
 		b.WriteString("***@")
 	}
@@ -276,19 +368,52 @@ func Redact(u *url.URL) string {
 	return b.String()
 }
 
-// parseProxyURL validates a proxy URL. Errors never include the raw value
-// when it could carry credentials.
+// errWithheld is the parse error for a proxy URL with credentials: the
+// value is never echoed.
+var errWithheld = errors.New("netproxy: invalid proxy URL (value withheld: it contains credentials)")
+
+// parseProxyURL validates a proxy URL. Errors never include credentials.
+//
+// The userinfo is split off by hand at the LAST "@" rather than by
+// url.Parse, which ends the authority at the first '/', '?' or '#'. Proxy
+// credentials are often tokens that contain those characters unescaped
+// (base64 uses '/'); url.Parse would take part of such a token as the proxy
+// host, which then shows up in logs and errors and is looked up in DNS.
+// Here everything before the last "@" is credentials, and is only ever
+// percent-decoded and sent in Proxy-Authorization.
 func parseProxyURL(raw string) (*url.URL, error) {
 	s := strings.TrimSpace(raw)
-	if !strings.Contains(s, "://") {
+	scheme, rest, ok := strings.Cut(s, "://")
+	if !ok || !validScheme(scheme) {
 		// "proxy.internal:3128" / "user:pass@proxy:3128": the scheme is
 		// conventionally optional and means http.
-		s = "http://" + s
+		scheme, rest = "http", s
 	}
-	u, err := url.Parse(s)
+	scheme = strings.ToLower(scheme)
+	switch scheme {
+	case "http", "https":
+	default:
+		if strings.Contains(rest, "@") && !knownScheme[scheme] {
+			// The "scheme" could be a user name ("user://pass@host").
+			return nil, errors.New("netproxy: unsupported proxy scheme (want http or https)")
+		}
+		return nil, fmt.Errorf("netproxy: unsupported proxy scheme %q (want http or https)", scheme)
+	}
+
+	var user *url.Userinfo
+	hostPart := rest
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		var err error
+		if user, err = parseUserinfo(rest[:at]); err != nil {
+			return nil, err
+		}
+		hostPart = rest[at+1:]
+	}
+	// hostPart holds no credentials: everything up to the last "@" is gone.
+	u, err := url.Parse(scheme + "://" + hostPart)
 	if err != nil {
-		if strings.Contains(s, "@") {
-			return nil, errors.New("netproxy: invalid proxy URL (value withheld: it contains credentials)")
+		if user != nil {
+			return nil, errWithheld
 		}
 		var ue *url.Error
 		if errors.As(err, &ue) {
@@ -296,16 +421,62 @@ func parseProxyURL(raw string) (*url.URL, error) {
 		}
 		return nil, fmt.Errorf("netproxy: invalid proxy URL: %v", err)
 	}
-	u.Scheme = strings.ToLower(u.Scheme)
-	switch u.Scheme {
-	case "http", "https":
-	default:
-		return nil, fmt.Errorf("netproxy: unsupported proxy scheme %q (want http or https)", u.Scheme)
-	}
+	u.User = user
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("netproxy: proxy URL %s has no host", Redact(u))
 	}
 	return u, nil
+}
+
+// parseUserinfo decodes "user[:password]" (percent-escapes allowed, other
+// characters taken literally). The error never includes the value. An
+// empty userinfo ("http://@proxy") means no credentials.
+func parseUserinfo(s string) (*url.Userinfo, error) {
+	if s == "" {
+		return nil, nil
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < ' ' || c == 0x7f {
+			return nil, errWithheld
+		}
+	}
+	name, password, hasPassword := strings.Cut(s, ":")
+	name, err := url.PathUnescape(name)
+	if err != nil {
+		return nil, errWithheld
+	}
+	if !hasPassword {
+		return url.User(name), nil
+	}
+	if password, err = url.PathUnescape(password); err != nil {
+		return nil, errWithheld
+	}
+	return url.UserPassword(name, password), nil
+}
+
+// validScheme reports whether s is a syntactically valid URL scheme
+// (RFC 3986: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )).
+func validScheme(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+		case i > 0 && ('0' <= c && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// knownScheme lists schemes that are safe to echo in an error even when
+// the value carries credentials.
+var knownScheme = map[string]bool{
+	"socks": true, "socks4": true, "socks4a": true, "socks5": true, "socks5h": true,
+	"ftp": true, "ws": true, "wss": true, "quic": true, "h2": true, "file": true,
 }
 
 // proxyHostPort is the address to dial for the proxy itself, with the
