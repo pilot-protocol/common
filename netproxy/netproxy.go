@@ -29,8 +29,10 @@
 // Authentication Required on every new CONNECT, while tunnels it already
 // opened stay up. A Resolver therefore re-reads its proxy settings:
 //
-//   - on a timer (DefaultRefreshInterval, see WithRefreshInterval), the next
-//     time a proxy is looked up after the interval has passed;
+//   - on a timer (DefaultRefreshInterval, see WithRefreshInterval): the
+//     first lookup after the interval has passed starts a refresh in the
+//     background and, like every lookup, answers from the settings in hand,
+//     so a slow refresh never holds up a connection;
 //   - immediately when a proxy rejects its credentials: Dialer and
 //     RefreshingTransport then refresh once and retry once on a new
 //     connection, and only when the refresh produced different credentials.
@@ -421,15 +423,13 @@ func (st *proxyState) ignoredSuffix() string {
 // ProxyForAddr returns the proxy to tunnel a raw TCP (or TLS) connection to
 // addr ("host:port") through, or nil to dial directly. addr is inspected as
 // text only; host names are never resolved. When the refresh interval has
-// passed, the lookup first refreshes the settings (see Refresh).
+// passed, the lookup starts a refresh in the background (see
+// WithRefreshInterval) and answers from the current settings; it never
+// waits for a refresh.
 func (r *Resolver) ProxyForAddr(addr string) (*url.URL, error) {
-	return r.proxyForAddr(context.Background(), addr)
-}
-
-func (r *Resolver) proxyForAddr(ctx context.Context, addr string) (*url.URL, error) {
 	// current first: a refresh can turn proxying on (a variable set in
 	// place, a refresh source's first URL).
-	st := r.current(ctx)
+	st := r.current()
 	if !st.proxies() {
 		return nil, nil
 	}
@@ -456,13 +456,14 @@ func (r *Resolver) pickAddr(st *proxyState, addr string) (*url.URL, error) {
 // https:// and wss:// requests follow exactly the same rules as ProxyForAddr
 // (net/http then tunnels them with CONNECT, sending the host name); http://
 // and ws:// requests prefer HTTP_PROXY in ModeAuto. The result is always
-// the current (refreshed) proxy URL; RefreshingTransport also retries a
-// request once when the proxy rejects the credentials.
+// the current proxy URL, and like ProxyForAddr the lookup never waits for a
+// refresh; RefreshingTransport also retries a request once when the proxy
+// rejects the credentials.
 func (r *Resolver) ProxyForRequest(req *http.Request) (*url.URL, error) {
 	if req == nil || req.URL == nil {
 		return nil, nil
 	}
-	st := r.current(req.Context())
+	st := r.current()
 	if !st.proxies() {
 		return nil, nil
 	}

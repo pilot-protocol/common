@@ -5,9 +5,13 @@ package netproxy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync/atomic"
 )
 
 // RefreshingTransport returns an http.RoundTripper for HTTP clients behind
@@ -34,15 +38,23 @@ import (
 // code. RefreshingTransport therefore reads the status from the CONNECT
 // response itself (http.Transport.OnProxyConnectResponse, chained after
 // base's own hook) and turns every non-200 answer into a *ConnectError,
-// whose message never includes proxy-supplied text. A CONNECT response
-// net/http cannot parse ("malformed HTTP status code"), which is how some
-// proxies' rejections surface, also triggers a refresh; since such an error
-// could in principle come from the server instead, it is retried only for
-// the idempotent methods above.
+// whose message never includes proxy-supplied text.
 //
-// Connections already open, including tunnels in the idle pool, are left
-// alone; they keep working until the proxy or the server closes them. The
-// returned RoundTripper has a CloseIdleConnections method, so
+// A CONNECT response net/http cannot parse ("malformed HTTP status code",
+// say), which is how some proxies' rejections surface, also triggers a
+// refresh, and its error likewise says only what was wrong with the
+// response, never its text. That holds only while the tunnel is being set
+// up: once net/http has a connection to send the request on, an unparseable
+// response came from the server through the tunnel, and its error is
+// returned untouched, without a refresh. Having no status code to prove it
+// a refusal, such a rejection is retried only for the idempotent methods
+// above.
+//
+// net/http pools connections by proxy URL, credentials included, so once a
+// refresh changes the proxy settings, the idle connections opened under the
+// old ones can never be picked again. The first request after such a change
+// therefore closes the idle connections (in-flight ones finish normally).
+// The returned RoundTripper has a CloseIdleConnections method, so
 // http.Client.CloseIdleConnections reaches the copy of base.
 func RefreshingTransport(base *http.Transport, r *Resolver) http.RoundTripper {
 	var tr *http.Transport
@@ -54,7 +66,13 @@ func RefreshingTransport(base *http.Transport, r *Resolver) http.RoundTripper {
 	default:
 		tr = &http.Transport{}
 	}
-	tr.Proxy = r.ProxyForRequest
+	tr.Proxy = func(req *http.Request) (*url.URL, error) {
+		u, err := r.ProxyForRequest(req)
+		if a, ok := req.Context().Value(attemptKey{}).(*attempt); ok {
+			a.proxy.Store(u)
+		}
+		return u, err
+	}
 	next := tr.OnProxyConnectResponse
 	tr.OnProxyConnectResponse = func(ctx context.Context, proxyURL *url.URL, connectReq *http.Request, res *http.Response) error {
 		if next != nil {
@@ -72,13 +90,35 @@ func RefreshingTransport(base *http.Transport, r *Resolver) http.RoundTripper {
 		}
 		return ce
 	}
-	return &refreshingTransport{tr: tr, r: r}
+	t := &refreshingTransport{tr: tr, r: r}
+	t.pooled.Store(r.snapshot())
+	return t
 }
 
 type refreshingTransport struct {
 	tr *http.Transport
 	r  *Resolver
+
+	// pooled is the Resolver's reading that the connections in tr's idle
+	// pool were (last known to be) opened under.
+	pooled atomic.Pointer[proxyState]
 }
+
+// attempt records, for one try of a request, what net/http did with it.
+// It travels in the request's context.
+type attempt struct {
+	// proxy is what the Proxy function returned for the latest connection
+	// lookup: the proxy URL, with the credentials, that a refused CONNECT
+	// was sent with.
+	proxy atomic.Pointer[url.URL]
+	// connected is set once net/http has a connection to send the request
+	// on, so any CONNECT for it succeeded. It is reset whenever net/http
+	// starts looking for a connection, since it retries some failures on a
+	// new one.
+	connected atomic.Bool
+}
+
+type attemptKey struct{}
 
 // authRejectedError is a 407 answer to a CONNECT, with the proxy URL (and
 // so the credentials) it was sent with. Its message is the ConnectError's.
@@ -90,39 +130,83 @@ type authRejectedError struct {
 func (e *authRejectedError) Unwrap() error { return e.ConnectError }
 
 func (t *refreshingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Noted before the lookup, so a timed refresh the lookup runs counts as
+	// Noted before the lookup, so a timed refresh the lookup starts counts as
 	// having happened after it (see Resolver.reauth).
 	start := t.r.attemptCount()
-	used, _ := t.r.ProxyForRequest(req)
-	resp, err := t.tr.RoundTrip(req)
-	if err == nil {
-		return resp, nil
+	t.dropStrandedConns()
+	resp, rej, err := t.send(req)
+	if rej.proxy == nil {
+		return resp, err
 	}
-
-	var rejectedWith *url.URL
-	var replayable bool
-	var ae *authRejectedError
-	switch {
-	case errors.As(err, &ae):
-		rejectedWith = ae.proxy
-		replayable = canReplay(req, true)
-	case used != nil && tunnelled(req) && isMalformedResponse(err):
-		rejectedWith = used
-		replayable = canReplay(req, false)
-	default:
-		return nil, err
-	}
-	_, retry, refreshErr := t.r.reauth(req.Context(), start, rejectedWith, func(st *proxyState) *url.URL {
+	_, retry, refreshErr := t.r.reauth(req.Context(), start, rej.proxy, func(st *proxyState) *url.URL {
 		return t.r.pickRequest(st, req)
 	})
-	if !retry || !replayable {
+	if !retry || !canReplay(req, rej.refused) {
 		return nil, withRefreshError(err, refreshErr)
 	}
 	again, rewindErr := rewind(req)
 	if rewindErr != nil {
 		return nil, err
 	}
-	return t.tr.RoundTrip(again)
+	resp, _, err = t.send(again)
+	return resp, err
+}
+
+// rejection describes a CONNECT the proxy turned down.
+type rejection struct {
+	// proxy is the proxy URL, with the credentials, the CONNECT was sent
+	// with; nil when the proxy did not reject the credentials.
+	proxy *url.URL
+	// refused is set for a 407: the tunnel was never opened, so the server
+	// cannot have seen the request.
+	refused bool
+}
+
+// send runs one try of req. When the proxy rejected the credentials it also
+// says with which ones, and it replaces net/http's error for an unparseable
+// CONNECT response with one that does not quote the response.
+func (t *refreshingTransport) send(req *http.Request) (*http.Response, rejection, error) {
+	a := new(attempt)
+	ctx := context.WithValue(req.Context(), attemptKey{}, a)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn: func(string) { a.connected.Store(false) },
+		GotConn: func(httptrace.GotConnInfo) { a.connected.Store(true) },
+	})
+	resp, err := t.tr.RoundTrip(req.WithContext(ctx))
+	if err == nil {
+		resp.Request = req // not the copy carrying the trace
+		return resp, rejection{}, nil
+	}
+	var ae *authRejectedError
+	if errors.As(err, &ae) {
+		return nil, rejection{proxy: ae.proxy, refused: true}, err
+	}
+	// Without a connection, the response net/http could not parse was the
+	// proxy's answer to CONNECT; with one, it came from the server.
+	used := a.proxy.Load()
+	if fault := responseFault(err); fault != "" && used != nil && tunnelled(req) && !a.connected.Load() {
+		return nil, rejection{proxy: used}, fmt.Errorf("proxy CONNECT %s: %w", connectTarget(req.URL), &badConnectResponse{what: fault})
+	}
+	return nil, rejection{}, err
+}
+
+// dropStrandedConns closes the idle connections once the Resolver's proxy
+// settings have changed since they were opened: net/http keys its pool by
+// proxy URL, credentials included, and would never pick them again.
+func (t *refreshingTransport) dropStrandedConns() {
+	cur := t.r.snapshot()
+	if prev := t.pooled.Swap(cur); prev != cur && !prev.sameProxies(cur) {
+		t.tr.CloseIdleConnections()
+	}
+}
+
+// connectTarget is the "host:port" net/http sends CONNECT for u.
+func connectTarget(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	return net.JoinHostPort(u.Hostname(), port)
 }
 
 // CloseIdleConnections closes the idle connections of the underlying

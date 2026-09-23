@@ -3,6 +3,7 @@
 package netproxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -269,7 +271,7 @@ func TestRefreshingTransportMalformedRejection(t *testing.T) {
 	}
 	creds.rotate()
 	_, err = do(t, client, http.MethodPost, api.url("/"), strings.NewReader("x"))
-	if err == nil || !strings.Contains(err.Error(), "malformed HTTP status code") {
+	if err == nil || !strings.Contains(err.Error(), "proxy CONNECT "+net.JoinHostPort(apiHost, api.port)+": read CONNECT response: malformed HTTP status code (response text withheld)") {
 		t.Fatalf("POST after a garbled 407: error = %v", err)
 	}
 	if got, runs := proxy.rejected.Load(), creds.runs(); got != 2 || runs != 3 {
@@ -341,5 +343,175 @@ func TestCanReplay(t *testing.T) {
 		if got := canReplay(tc.req, tc.neverSent); got != tc.want {
 			t.Errorf("%s: canReplay = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// Only the proxy's answer to CONNECT can trigger a refresh. A server that
+// answers through the tunnel with a response net/http cannot parse gets its
+// error passed on untouched, and never makes the transport run the refresh
+// command (which it used to do on every request).
+func TestRefreshingTransportIgnoresMalformedServerResponses(t *testing.T) {
+	t.Parallel()
+	cert, pool := genCert(t, []string{apiHost}, nil)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(5 * time.Second))
+				if _, err := http.ReadRequest(bufio.NewReader(c)); err != nil {
+					return
+				}
+				io.WriteString(c, "HTTP/1.1 200OK\r\nContent-Length: 0\r\n\r\n")
+			}()
+		}
+	}()
+	t.Cleanup(func() { ln.Close(); wg.Wait() })
+	ip, port, _ := net.SplitHostPort(ln.Addr().String())
+
+	proxy := newTestProxy(t, map[string]string{apiHost: ip})
+	creds := newCredSource(t, proxy)
+	r, err := NewResolver(creds.current(), WithRefreshCommand(creds.command()), WithRefreshInterval(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: RefreshingTransport(&http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}, r), Timeout: 10 * time.Second}
+	defer client.CloseIdleConnections()
+	const n = 5
+	for i := 0; i < n; i++ {
+		_, err := client.Get("https://" + net.JoinHostPort(apiHost, port) + "/")
+		if err == nil || !strings.Contains(err.Error(), `malformed HTTP status code "200OK"`) || strings.Contains(err.Error(), "withheld") {
+			t.Fatalf("GET %d: error = %v, want net/http's own", i, err)
+		}
+	}
+	if got := creds.runs(); got != 1 {
+		t.Fatalf("%d malformed server responses ran the refresh command %d times, want 0", n, got-1)
+	}
+	if got := proxy.rejected.Load(); got != 0 {
+		t.Fatalf("proxy rejected %d CONNECTs, want 0", got)
+	}
+}
+
+// countingServer is an HTTPS server, reachable as apiHost through the test
+// proxy, that counts its open connections.
+type countingServer struct {
+	ip, port string
+	pool     *x509.CertPool
+	open     atomic.Int32
+}
+
+func newCountingServer(t *testing.T) *countingServer {
+	t.Helper()
+	cert, pool := genCert(t, []string{apiHost}, nil)
+	s := &countingServer{pool: pool}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") }))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateNew:
+			s.open.Add(1)
+		case http.StateClosed, http.StateHijacked:
+			s.open.Add(-1)
+		}
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	s.ip, s.port, _ = net.SplitHostPort(srv.Listener.Addr().String())
+	return s
+}
+
+// net/http pools tunnels by proxy URL, credentials included, so after a
+// refresh changes the credentials the idle tunnels opened with the old ones
+// can never be picked again. The next request closes them rather than
+// leaving one open per rotation (for good, with IdleConnTimeout unset). A
+// refresh that reads the same settings again leaves the pool alone.
+func TestRefreshingTransportDropsTunnelsStrandedByARotation(t *testing.T) {
+	t.Parallel()
+	srv := newCountingServer(t)
+	proxy := newTestProxy(t, map[string]string{apiHost: srv.ip})
+	creds := newCredSource(t, proxy)
+	r, err := NewResolver(creds.current(), WithRefreshCommand(creds.command()), WithRefreshInterval(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: srv.pool}} // no IdleConnTimeout
+	client := &http.Client{Transport: RefreshingTransport(base, r), Timeout: 10 * time.Second}
+	defer client.CloseIdleConnections()
+	get := func() {
+		t.Helper()
+		resp, err := client.Get("https://" + net.JoinHostPort(apiHost, srv.port) + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	for i := 0; i < 3; i++ {
+		get()
+	}
+	if targets, _, _ := proxy.seen(); len(targets) != 1 {
+		t.Fatalf("3 GETs opened %d tunnels, want 1 (reused)", len(targets))
+	}
+
+	const rotations = 5
+	for i := 0; i < rotations; i++ {
+		creds.rotate()
+		for j := 0; j < 2; j++ { // the second reads the same credentials again
+			if err := r.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		get()
+		get()
+	}
+	if targets, _, _ := proxy.seen(); len(targets) != 1+rotations {
+		t.Fatalf("opened %d tunnels, want %d: one per rotation, each then reused", len(targets), 1+rotations)
+	}
+	if got := proxy.rejected.Load(); got != 0 {
+		t.Fatalf("proxy rejected %d CONNECTs, want 0", got)
+	}
+	waitFor(t, "the tunnels opened with old credentials to close", func() bool { return srv.open.Load() == 1 })
+}
+
+// A rejection whose status line or headers net/http cannot parse is
+// reported by what was wrong with it, never by its text, which the proxy
+// can fill with anything, the credentials it was sent included; a 407's
+// reason phrase has always been withheld for the same reason.
+func TestUnparseableRejectionNeverQuotesTheProxy(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ line, what string }{
+		{"HTTP/1.1 407Denied:muse-agent:hunter2", "malformed HTTP status code"},
+		{"HTTP/1.1 407 Proxy Authentication Required\r\nDenied muse-agent hunter2", "malformed MIME header"},
+		{"HTTP/1.1 407 Proxy Authentication Required\r\nTransfer-Encoding: muse-agent:hunter2", "unsupported transfer encoding"},
+	} {
+		proxy := newTestProxy(t, nil, withAuth("u", "p"), withRejectLine(tc.line))
+		r := mustExplicit(t, proxy.url("muse-agent:hunter2"))
+		want := "read CONNECT response: " + tc.what + " (response text withheld)"
+
+		_, err := NewDialer(r).DialContext(context.Background(), "tcp", "api.pilot.invalid:443")
+		if err == nil || !strings.HasSuffix(err.Error(), want) || strings.Contains(err.Error(), "hunter2") {
+			t.Fatalf("%q: Dialer error = %v, want it to end %q", tc.line, err, want)
+		}
+
+		client := &http.Client{Transport: RefreshingTransport(nil, r), Timeout: 10 * time.Second}
+		_, err = client.Get("https://api.pilot.invalid/")
+		if err == nil || !strings.Contains(err.Error(), "proxy CONNECT api.pilot.invalid:443: "+want) || strings.Contains(err.Error(), "hunter2") {
+			t.Fatalf("%q: RefreshingTransport error = %v, want %q", tc.line, err, want)
+		}
+		client.CloseIdleConnections()
 	}
 }

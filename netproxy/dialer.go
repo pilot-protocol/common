@@ -43,6 +43,10 @@ const DefaultTimeout = 30 * time.Second
 // (see Resolver.Refresh) and, if that produced different credentials,
 // retries once on a new connection. Tunnels opened earlier are never
 // touched. A Resolver with nothing to refresh gets no retry.
+//
+// Errors never quote the proxy's response: a 407 or other refusal is a
+// *ConnectError, and a response that cannot be parsed is reported by what
+// was wrong with it ("malformed HTTP status code", say) without its text.
 type Dialer struct {
 	// Resolver picks the proxy per target. nil never proxies.
 	Resolver *Resolver
@@ -105,10 +109,10 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Noted before the pick, so a refresh the pick itself runs counts as
-	// having happened after it.
+	// Noted before the pick, so a timed refresh the pick itself starts
+	// counts as having happened after it (see Resolver.reauth).
 	start := resolver.attemptCount()
-	proxyURL, err := resolver.proxyForAddr(ctx, addr)
+	proxyURL, err := resolver.ProxyForAddr(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -149,23 +153,59 @@ func credentialsRejected(err error) bool {
 	return errors.As(err, &bad)
 }
 
-// badConnectResponse is a CONNECT response http.ReadResponse rejected as
-// malformed (as opposed to an I/O error while reading it).
-type badConnectResponse struct{ err error }
+// badConnectResponse is a CONNECT response that could not be parsed (as
+// opposed to an I/O error while reading it). It keeps only what was wrong
+// with the response: net/http's own message quotes the offending bytes,
+// and a proxy can fill those with whatever it likes, including the
+// Proxy-Authorization it was sent.
+type badConnectResponse struct {
+	// what is a fixed description, e.g. "malformed HTTP status code".
+	what string
+}
 
-func (e *badConnectResponse) Error() string { return "read CONNECT response: " + e.err.Error() }
+func (e *badConnectResponse) Error() string {
+	return "read CONNECT response: " + e.what + " (response text withheld)"
+}
 
-func (e *badConnectResponse) Unwrap() error { return e.err }
+// responseFaults are net/http's (and net/textproto's) complaints about a
+// response http.ReadResponse cannot parse, most specific first. Their
+// messages go on to quote the offending text, which is why only these
+// fixed descriptions are ever kept.
+var responseFaults = []string{
+	"malformed HTTP status code",
+	"malformed HTTP response",
+	"malformed HTTP version",
+	"malformed MIME header initial line",
+	"malformed MIME header line",
+	"malformed MIME header",
+	"invalid empty Content-Length",
+	"bad Content-Length",
+	"multiple Content-Length headers",
+	"too many transfer encodings",
+	"unsupported transfer encoding",
+	"invalid Trailer key",
+}
 
-// isMalformedResponse reports whether err is net/http's complaint about an
-// unparseable response ("malformed HTTP status code", "malformed HTTP
-// response", "malformed HTTP version", "malformed MIME header line").
-func isMalformedResponse(err error) bool {
+// responseFault returns which of responseFaults err reports, or "" if none.
+func responseFault(err error) string {
 	if err == nil {
-		return false
+		return ""
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "malformed HTTP ") || strings.Contains(msg, "malformed MIME header")
+	for _, fault := range responseFaults {
+		if strings.Contains(msg, fault) {
+			return fault
+		}
+	}
+	return ""
+}
+
+// isReadError reports whether err is a failure to read (the connection
+// closing, timing out or breaking) rather than a complaint about what was
+// read. Such errors carry no text from the peer.
+func isReadError(err error) bool {
+	var ne net.Error
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &ne)
 }
 
 func (d *Dialer) forward(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -256,10 +296,15 @@ func (d *Dialer) connect(ctx context.Context, conn net.Conn, proxyURL *url.URL, 
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
-		if isMalformedResponse(err) {
-			return nil, &badConnectResponse{err: err}
+		if isReadError(err) {
+			return nil, fmt.Errorf("read CONNECT response: %w", err)
 		}
-		return nil, fmt.Errorf("read CONNECT response: %w", err)
+		// Anything else is about the bytes the proxy sent, and quotes them.
+		what := responseFault(err)
+		if what == "" {
+			what = "unparseable response"
+		}
+		return nil, &badConnectResponse{what: what}
 	}
 	// The body is never read: on success the rest of the stream belongs to
 	// the tunnel, and on failure the conn is discarded.

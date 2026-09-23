@@ -152,6 +152,34 @@ func (e *syncEnv) set(k, v string) {
 	e.mu.Unlock()
 }
 
+// settle waits for the refresh in flight, if any, to land. Timed refreshes
+// run in the background, so tests that want their result wait for it here.
+func settle(t *testing.T, r *Resolver) {
+	t.Helper()
+	r.mu.Lock()
+	c := r.inflight
+	r.mu.Unlock()
+	if c == nil {
+		return
+	}
+	select {
+	case <-c.done:
+	case <-time.After(refreshTimeout + 5*time.Second):
+		t.Fatal("the refresh in flight never finished")
+	}
+}
+
+// lookupAfterTimedRefresh returns the proxy for addr once a timed refresh
+// that started after the caller's last change has landed. r's refresh
+// interval must be tiny.
+func lookupAfterTimedRefresh(t *testing.T, r *Resolver, addr string) string {
+	t.Helper()
+	settle(t, r)         // one already in flight may have read the old settings
+	proxyFor(t, r, addr) // the interval has passed: starts a refresh
+	settle(t, r)
+	return proxyFor(t, r, addr)
+}
+
 func dialEcho(t *testing.T, d *Dialer, target, msg string) net.Conn {
 	t.Helper()
 	c, err := d.DialContext(context.Background(), "tcp", target)
@@ -349,8 +377,9 @@ func TestRefreshCommandFailureKeepsLastGoodCredentials(t *testing.T) {
 // user1 returns the first generation's credentials.
 func (c *credSource) user1() (user, pass string) { return "muse-agent", "tok/1?r#s@t" }
 
-// Lookups refresh on the timer too. With a failing command every lookup
-// keeps the last good URL, and the failure is still reported only once.
+// Lookups start refreshes on the timer too. With a failing command every
+// lookup keeps the last good URL, and the failure is still reported only
+// once.
 func TestRefreshIntervalKeepsLastGoodOnFailure(t *testing.T) {
 	t.Parallel()
 	echoIP, echoPort := newEchoServer(t)
@@ -366,6 +395,7 @@ func TestRefreshIntervalKeepsLastGoodOnFailure(t *testing.T) {
 	creds.fail(true)
 	for i := 0; i < 3; i++ {
 		dialEcho(t, d, target, "on the last good credentials").Close()
+		settle(t, r) // the timed refresh this dial started fails
 	}
 	if got := creds.runs(); got != 4 {
 		t.Fatalf("command ran %d times, want 4 (build + one per lookup)", got)
@@ -374,10 +404,13 @@ func TestRefreshIntervalKeepsLastGoodOnFailure(t *testing.T) {
 		t.Fatalf("error handler called %d times, want 1: %v", len(e), e)
 	}
 
-	// Once the command works, a lookup picks up rotated credentials without
-	// waiting for a 407.
+	// Once the command works, a timed refresh picks up rotated credentials
+	// without waiting for a 407.
 	creds.fail(false)
 	creds.rotate()
+	if got := lookupAfterTimedRefresh(t, r, target); got != creds.current() {
+		t.Fatalf("after a timed refresh: proxy %q, want the rotated URL", got)
+	}
 	dialEcho(t, d, target, "rotated").Close()
 	if got := proxy.rejected.Load(); got != 0 {
 		t.Fatalf("proxy rejected %d CONNECTs, want 0: the timed refresh ran first", got)
@@ -475,7 +508,7 @@ func TestRefreshAutoModeRereadsEnvironment(t *testing.T) {
 	}
 	env2.set("HTTPS_PROXY", "http://b.invalid:2")
 	env2.set("NO_PROXY", "skip.invalid")
-	if got := proxyFor(t, r2, "x.invalid:443"); got != "http://b.invalid:2" {
+	if got := lookupAfterTimedRefresh(t, r2, "x.invalid:443"); got != "http://b.invalid:2" {
 		t.Fatalf("after the environment changed: proxy %q", got)
 	}
 	if got := proxyFor(t, r2, "skip.invalid:443"); got != "" {
@@ -492,7 +525,7 @@ func TestRefreshAutoModeRereadsEnvironment(t *testing.T) {
 		t.Fatal("empty environment proxies")
 	}
 	env3.set("https_proxy", "http://late.invalid:3128")
-	if got := proxyFor(t, r3, "x.invalid:443"); got != "http://late.invalid:3128" {
+	if got := lookupAfterTimedRefresh(t, r3, "x.invalid:443"); got != "http://late.invalid:3128" {
 		t.Fatalf("after https_proxy was set: proxy %q", got)
 	}
 	if got := proxyForURL(t, r3, "https://x.invalid/"); got != "http://late.invalid:3128" {
@@ -504,7 +537,7 @@ func TestRefreshAutoModeRereadsEnvironment(t *testing.T) {
 
 	// An unusable HTTPS_PROXY is a failed refresh: the last reading stays.
 	env2.set("HTTPS_PROXY", "socks5://c.invalid:3")
-	if got := proxyFor(t, r2, "x.invalid:443"); got != "http://b.invalid:2" {
+	if got := lookupAfterTimedRefresh(t, r2, "x.invalid:443"); got != "http://b.invalid:2" {
 		t.Fatalf("after an unusable HTTPS_PROXY: proxy %q", got)
 	}
 	var ee *EnvError
@@ -571,9 +604,10 @@ func TestDialerRefreshesOnMalformedRejection(t *testing.T) {
 		t.Fatalf("rejected %d, command runs %d; want 1 and 2", got, runs)
 	}
 
-	// Without anything to refresh, the error is returned as before.
+	// Without anything to refresh, the error is returned, naming what was
+	// wrong with the response but not quoting it.
 	_, err = NewDialer(mustExplicit(t, proxy.url("u:wrong"))).Dial("tcp", target)
-	if err == nil || !strings.Contains(err.Error(), `read CONNECT response: malformed HTTP status code "407Proxy"`) {
+	if err == nil || !strings.HasSuffix(err.Error(), "read CONNECT response: malformed HTTP status code (response text withheld)") || strings.Contains(err.Error(), "407Proxy") {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -748,7 +782,8 @@ func TestNewResolverOptions(t *testing.T) {
 	}
 
 	// Timed refreshes: within the interval lookups reuse the last reading;
-	// after it, one lookup refreshes. A negative interval never does.
+	// after it, a lookup starts a refresh, whose result later lookups get.
+	// A negative interval never refreshes.
 	var n atomic.Int32
 	counting := WithRefreshFunc(func(context.Context) (string, error) {
 		return fmt.Sprintf("http://p%d.invalid:1", n.Add(1)), nil
@@ -763,6 +798,8 @@ func TestNewResolverOptions(t *testing.T) {
 		}
 	}
 	time.Sleep(250 * time.Millisecond)
+	proxyFor(t, timed, "x.invalid:443") // p1, or p2 if the refresh won the race
+	settle(t, timed)
 	if got := proxyFor(t, timed, "x.invalid:443"); got != "http://p2.invalid:1" {
 		t.Fatalf("after the interval: proxy %q", got)
 	}
@@ -812,4 +849,152 @@ func TestRefreshWaitHonoursContext(t *testing.T) {
 	if n.Load() != 2 {
 		t.Fatalf("source ran %d times, want 2", n.Load())
 	}
+}
+
+// A timed refresh runs in the background. While one hangs, dials with a
+// budget far shorter than the refresh timeout (the registry client allows
+// 5 s a dial) go out at once on the cached credentials, which still work,
+// and so do HTTP proxy lookups. Only a 407 waits for the refresh.
+func TestTimedRefreshNeverBlocksALookup(t *testing.T) {
+	t.Parallel()
+	echoIP, echoPort := newEchoServer(t)
+	proxy := newTestProxy(t, map[string]string{echoHost: echoIP})
+	creds := newCredSource(t, proxy)
+	urlFile := filepath.Join(creds.dir, "url")
+	release := make(chan struct{})
+	var runs atomic.Int32
+	r, err := NewResolver(proxy.url("launch:time"), WithRefreshFunc(func(ctx context.Context) (string, error) {
+		if runs.Add(1) > 1 {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		b, err := os.ReadFile(urlFile)
+		return string(b), err
+	}), WithRefreshInterval(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDialer(r)
+	target := net.JoinHostPort(echoHost, echoPort)
+	time.Sleep(30 * time.Millisecond) // a timed refresh is due
+
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		begin := time.Now()
+		c, err := d.DialContext(ctx, "tcp", target)
+		cancel()
+		if err != nil {
+			t.Fatalf("dial %d while a timed refresh hangs: %v", i, err)
+		}
+		roundTrip(t, c, "on the cached credentials")
+		c.Close()
+		if took := time.Since(begin); took > time.Second {
+			t.Fatalf("dial %d took %v: it waited for the timed refresh", i, took)
+		}
+		begin = time.Now()
+		if got := proxyForURL(t, r, "https://api.pilot.invalid/"); got == "" || time.Since(begin) > time.Second {
+			t.Fatalf("request lookup %d: proxy %q after %v", i, got, time.Since(begin))
+		}
+	}
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("refresh source ran %d times, want 2: build, then one timed refresh that no lookup repeats while it runs", got)
+	}
+	if got := proxy.rejected.Load(); got != 0 {
+		t.Fatalf("proxy rejected %d CONNECTs, want 0", got)
+	}
+
+	// The proxy rotates while the refresh still hangs: the rejected dial
+	// waits for that refresh, which reads the new credentials once it is
+	// released, and retries with them.
+	creds.rotate()
+	time.AfterFunc(100*time.Millisecond, func() { close(release) })
+	dialEcho(t, d, target, "after the rotation").Close()
+	if got := proxy.rejected.Load(); got != 1 {
+		t.Fatalf("proxy rejected %d CONNECTs, want 1", got)
+	}
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("refresh source ran %d times, want still 2: the 407 joined the refresh in flight", got)
+	}
+}
+
+// A refresh command that times out is killed together with everything it
+// started. So is whatever a finished command leaves behind holding its
+// output. Before, only sh was killed, and every hung refresh left its
+// children running.
+func TestRefreshCommandKillsWhatItStarted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("refresh commands run with sh -c and process groups")
+	}
+	defer func(d time.Duration) { refreshTimeout = d }(refreshTimeout)
+
+	dir := t.TempDir()
+	// beat.sh appends to $1 every 50 ms for as long as it lives.
+	beat := filepath.Join(dir, "beat.sh")
+	script := "echo $$ >> " + shellQuote(filepath.Join(dir, "pids")) + "\nwhile :; do echo . >> \"$1\"; sleep 0.05; done\n"
+	if err := os.WriteFile(beat, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Only matters if the test fails: do not leave the beaters behind.
+		b, _ := os.ReadFile(filepath.Join(dir, "pids"))
+		for _, f := range strings.Fields(string(b)) {
+			var pid int
+			if _, err := fmt.Sscan(f, &pid); err == nil && pid > 1 {
+				if p, err := os.FindProcess(pid); err == nil {
+					p.Kill()
+				}
+			}
+		}
+	})
+	size := func(name string) int64 {
+		fi, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("%s never started: %v", name, err)
+		}
+		return fi.Size()
+	}
+	assertStopped := func(names ...string) {
+		t.Helper()
+		time.Sleep(100 * time.Millisecond) // a write in progress lands
+		before := make([]int64, len(names))
+		for i, n := range names {
+			before[i] = size(n)
+		}
+		time.Sleep(400 * time.Millisecond)
+		for i, n := range names {
+			if after := size(n); after != before[i] {
+				t.Fatalf("%s is still running after the refresh returned (%d -> %d bytes)", n, before[i], after)
+			}
+		}
+	}
+
+	// Timeout: a background job and a foreground child that never
+	// finishes. Neither is sh itself.
+	refreshTimeout = 500 * time.Millisecond
+	cmd := fmt.Sprintf("sh %[1]s %[2]s & sh %[1]s %[3]s; echo http://late.invalid:1",
+		shellQuote(beat), shellQuote(filepath.Join(dir, "bg")), shellQuote(filepath.Join(dir, "fg")))
+	var errs errorLog
+	if _, err := NewResolver("http://initial.invalid:3128", WithRefreshCommand(cmd), errs.handler()); err != nil {
+		t.Fatal(err)
+	}
+	if e := errs.all(); len(e) != 1 || e[0].Error() != "netproxy: refresh command timed out after 500ms" {
+		t.Fatalf("errors = %v", e)
+	}
+	assertStopped("bg", "fg")
+
+	// A command that prints its URL and exits, leaving a background job
+	// holding its stdout: the refresh fails, and the job is ended too.
+	refreshTimeout = 5 * time.Second
+	cmd = fmt.Sprintf("sh %s %s & echo http://late.invalid:1", shellQuote(beat), shellQuote(filepath.Join(dir, "held")))
+	var errs2 errorLog
+	if _, err := NewResolver("http://initial.invalid:3128", WithRefreshCommand(cmd), errs2.handler()); err != nil {
+		t.Fatal(err)
+	}
+	if e := errs2.all(); len(e) != 1 || e[0].Error() != "netproxy: refresh command left a process holding its output open" {
+		t.Fatalf("errors = %v", e)
+	}
+	assertStopped("held")
 }

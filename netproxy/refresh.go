@@ -22,7 +22,7 @@ import (
 const EnvRefreshCommand = "PILOT_PROXY_CMD"
 
 // DefaultRefreshInterval is how long a refreshing Resolver uses the settings
-// it last read before a lookup reads them again.
+// it last read before a lookup starts reading them again.
 const DefaultRefreshInterval = 60 * time.Second
 
 // refreshTimeout bounds one refresh (one run of the refresh command). A
@@ -54,16 +54,18 @@ func newOptions(opts []Option) options {
 
 // WithRefreshCommand makes the Resolver take its proxy URL from the output
 // of command, run with "sh -c" in the process's environment, stdin and
-// stderr discarded, for at most 10 seconds. The output, surrounding
-// whitespace trimmed, must be one http:// or https:// proxy URL with its
-// current credentials. It is never logged or included in errors.
+// stderr discarded, for at most 10 seconds. On Unix the command runs in a
+// process group of its own, and a run that times out has the whole group
+// killed, so the processes it started do not outlive it. The output,
+// surrounding whitespace trimmed, must be one http:// or https:// proxy URL
+// with its current credentials. It is never logged or included in errors.
 //
-// The command runs when NewResolver builds the Resolver, again at most
-// every refresh interval, and whenever a proxy rejects the credentials. Its
-// URL replaces the explicit URL, or in ModeAuto the environment's proxy
-// URLs, while NO_PROXY and the loopback exemption keep applying. If a run
-// fails, or prints nothing or something that is not a proxy URL, the last
-// good URL stays in use.
+// The command runs when NewResolver builds the Resolver, again in the
+// background at most every refresh interval, and whenever a proxy rejects
+// the credentials. Its URL replaces the explicit URL, or in ModeAuto the
+// environment's proxy URLs, while NO_PROXY and the loopback exemption keep
+// applying. If a run fails, or prints nothing or something that is not a
+// proxy URL, the last good URL stays in use.
 //
 // A child process inherits this process's environment, so the command must
 // read the current value from somewhere that tracks the rotation — in Meta
@@ -97,9 +99,13 @@ func WithRefreshFunc(fn func(ctx context.Context) (string, error)) Option {
 }
 
 // WithRefreshInterval sets how long the Resolver uses the settings it last
-// read before a lookup reads them again. Zero means DefaultRefreshInterval;
-// a negative interval turns timed refreshes off, leaving only the refreshes
-// a rejected credential triggers (and explicit Refresh calls).
+// read before a lookup starts reading them again. That timed refresh runs in
+// the background: the lookup that starts it, and every lookup while it runs,
+// answers from the settings in hand, so a slow or hung refresh source never
+// holds up a dial or a request (a proxy rejecting those settings is what
+// waits for a refresh). Zero means DefaultRefreshInterval; a negative
+// interval turns timed refreshes off, leaving only the refreshes a rejected
+// credential triggers (and explicit Refresh calls).
 func WithRefreshInterval(d time.Duration) Option {
 	return func(o *options) { o.interval = d }
 }
@@ -154,24 +160,20 @@ func (r *Resolver) snapshot() *proxyState {
 	return &emptyState
 }
 
-// current returns the settings for a lookup, refreshing them first when the
-// refresh interval has passed. If ctx ends before that refresh does, the
-// previous settings are returned.
-func (r *Resolver) current(ctx context.Context) *proxyState {
-	if !r.refreshable() || r.interval < 0 {
-		return r.snapshot()
-	}
-	r.mu.Lock()
-	var call *refreshCall
-	if time.Since(r.lastRun) >= r.interval {
-		call = r.inflight
-		if call == nil {
-			call = r.startLocked()
+// current returns the settings for a lookup. When the refresh interval has
+// passed it starts a refresh, but never waits for it: the lookup, like every
+// other one until the refresh lands, gets the settings in hand. Those are
+// the last good ones, which keep working until the proxy rotates them, and
+// a rotation is handled by reauth, which does wait. Waiting here instead
+// would make a slow refresh source fail dials whose own deadline is shorter
+// than the refresh's, although nothing was wrong with their credentials.
+func (r *Resolver) current() *proxyState {
+	if r.refreshable() && r.interval >= 0 {
+		r.mu.Lock()
+		if r.inflight == nil && time.Since(r.lastRun) >= r.interval {
+			r.startLocked()
 		}
-	}
-	r.mu.Unlock()
-	if call != nil {
-		call.wait(ctx)
+		r.mu.Unlock()
 	}
 	return r.snapshot()
 }
@@ -373,6 +375,9 @@ func commandSource(command string) func(context.Context) (string, error) {
 		// Stdin and Stderr stay nil (the null device): stderr could echo
 		// credentials, e.g. under "set -x".
 		cmd.WaitDelay = time.Second // a child left holding stdout cannot hang Wait
+		// On timeout, kill everything the command started, not just sh:
+		// otherwise every timed-out refresh leaves its hung children behind.
+		ownProcessGroup(cmd)
 		err := cmd.Run()
 		switch {
 		case ctx.Err() != nil:
@@ -383,6 +388,9 @@ func commandSource(command string) func(context.Context) (string, error) {
 				return "", fmt.Errorf("netproxy: refresh command failed: %s", ee.ProcessState)
 			}
 			if errors.Is(err, exec.ErrWaitDelay) {
+				// sh has exited, but a process it started held stdout
+				// open until now, so the group still has a member: end it.
+				_ = killProcessGroup(cmd)
 				return "", errors.New("netproxy: refresh command left a process holding its output open")
 			}
 			return "", fmt.Errorf("netproxy: refresh command failed to run: %v", err)
@@ -408,6 +416,12 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	}
 	b.buf = append(b.buf, p...)
 	return len(p), nil
+}
+
+// sameProxies reports whether st and o route through the same proxies with
+// the same credentials (NO_PROXY aside).
+func (st *proxyState) sameProxies(o *proxyState) bool {
+	return sameURL(st.fixed, o.fixed) && sameURL(st.secure, o.secure) && sameURL(st.plain, o.plain)
 }
 
 // sameURL reports whether a and b are the same proxy with the same
