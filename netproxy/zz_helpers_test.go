@@ -34,9 +34,15 @@ type testProxy struct {
 
 	// wantAuth, when set, is the only Proxy-Authorization value accepted;
 	// anything else gets rejectStatus (407 by default) with rejectReason.
+	// Guarded by mu: setAuth rotates it while the proxy runs.
 	wantAuth     string
 	rejectStatus int
 	rejectReason string
+	// rejectLine, when set, replaces the whole status line of a rejection
+	// (to send one net/http cannot parse).
+	rejectLine string
+	// rejected counts CONNECTs refused for their credentials.
+	rejected atomic.Int32
 	// hang makes the proxy read the CONNECT request and never answer.
 	hang bool
 
@@ -63,6 +69,19 @@ func withReject(status int, reason string) proxyOpt {
 }
 
 func withHang() proxyOpt { return func(p *testProxy) { p.hang = true } }
+
+// withRejectLine makes credential rejections use line as the status line.
+func withRejectLine(line string) proxyOpt {
+	return func(p *testProxy) { p.rejectLine = line }
+}
+
+// setAuth rotates the credentials the proxy accepts. Tunnels already open
+// are not affected, as with a real rotating proxy.
+func (p *testProxy) setAuth(user, pass string) {
+	p.mu.Lock()
+	p.wantAuth = basicAuth(user, pass)
+	p.mu.Unlock()
+}
 
 func withTLS(cert tls.Certificate) proxyOpt {
 	return func(p *testProxy) {
@@ -146,6 +165,7 @@ func (p *testProxy) serve(conn net.Conn) {
 	p.targets = append(p.targets, req.RequestURI)
 	p.hostHdrs = append(p.hostHdrs, req.Host)
 	p.auths = append(p.auths, req.Header.Get("Proxy-Authorization"))
+	wantAuth := p.wantAuth
 	p.mu.Unlock()
 
 	waitClientClose := func() {
@@ -161,8 +181,13 @@ func (p *testProxy) serve(conn net.Conn) {
 		fmt.Fprintf(conn, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
-	if p.wantAuth != "" && req.Header.Get("Proxy-Authorization") != p.wantAuth {
-		fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nProxy-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n", p.rejectStatus, p.rejectReason)
+	if wantAuth != "" && req.Header.Get("Proxy-Authorization") != wantAuth {
+		p.rejected.Add(1)
+		line := fmt.Sprintf("HTTP/1.1 %d %s", p.rejectStatus, p.rejectReason)
+		if p.rejectLine != "" {
+			line = p.rejectLine
+		}
+		fmt.Fprintf(conn, "%s\r\nProxy-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n", line)
 		waitClientClose()
 		return
 	}

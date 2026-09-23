@@ -21,12 +21,34 @@
 //   - Dialer is a DialContext-compatible dialer that tunnels through the
 //     proxy the Resolver picks, or dials directly when there is none.
 //
+// # Rotating credentials
+//
+// Some egress proxies (Meta Muse's, for one) rotate the credentials embedded
+// in HTTPS_PROXY every few minutes. A fresh shell sees the current value; a
+// long-running process keeps its launch-time copy and gets 407 Proxy
+// Authentication Required on every new CONNECT, while tunnels it already
+// opened stay up. A Resolver therefore re-reads its proxy settings:
+//
+//   - on a timer (DefaultRefreshInterval, see WithRefreshInterval), the next
+//     time a proxy is looked up after the interval has passed;
+//   - immediately when a proxy rejects its credentials: Dialer and
+//     RefreshingTransport then refresh once and retry once on a new
+//     connection, and only when the refresh produced different credentials.
+//
+// A ModeAuto Resolver re-reads the process environment. WithRefreshCommand
+// adds a command whose output is the current proxy URL, for processes whose
+// own environment never changes; by convention programs take that command
+// from EnvRefreshCommand (PILOT_PROXY_CMD). Concurrent rejections share one
+// refresh, and a failed refresh keeps the last good settings.
+//
 // Proxy credentials (URL userinfo) are only ever written to the proxy in a
 // Proxy-Authorization header. They never appear in errors or in the output
 // of Redact / Resolver.String, which is what callers must use for logging.
+// A refresh command's output is treated the same way and is never logged.
 package netproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -34,6 +56,9 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Mode names. Parse accepts ModeAuto and ModeOff (case-insensitive) in
@@ -49,11 +74,51 @@ const (
 
 // Resolver decides which proxy, if any, an outbound connection to a given
 // target should go through. A nil *Resolver is valid and never proxies.
-// Resolvers are immutable and safe for concurrent use.
+// Resolvers are safe for concurrent use.
+//
+// Off and Explicit Resolvers without a refresh source never change. A
+// ModeAuto Resolver, and any Resolver with a refresh source
+// (WithRefreshCommand, WithRefreshFunc), re-reads its settings over time;
+// see the package documentation under "Rotating credentials".
 type Resolver struct {
 	mode string
 
-	// fixed is the proxy for every target in ModeExplicit.
+	// getenv is the environment a ModeAuto Resolver reads (os.Getenv
+	// outside tests).
+	getenv func(string) string
+	// source, when set, supplies the current proxy URL; command reports
+	// that it runs a shell command (for String).
+	source  func(context.Context) (string, error)
+	command bool
+	// interval is the refresh TTL; negative disables timed refreshes.
+	interval time.Duration
+	// onError receives the first error of each run of failed refreshes.
+	onError func(error)
+
+	// state holds the current settings. Refreshes replace it whole, so a
+	// lookup always sees one consistent set.
+	state atomic.Pointer[proxyState]
+
+	mu sync.Mutex // guards the fields below
+	// inflight is the refresh in progress, which every caller joins.
+	inflight *refreshCall
+	// attempts counts refreshes started. A caller notes it before picking
+	// a proxy; if it has moved when the proxy then rejects the
+	// credentials, a refresh already ran after the pick and running
+	// another one right away cannot learn anything newer.
+	attempts uint64
+	// lastRun is when the last refresh finished (or the Resolver was built).
+	lastRun time.Time
+	// failing is set while refreshes keep failing, so onError hears about
+	// a run of failures once.
+	failing bool
+}
+
+// proxyState is one reading of a Resolver's settings.
+type proxyState struct {
+	// fixed is the proxy for every target in ModeExplicit, and in ModeAuto
+	// the proxy URL from the refresh source, which then replaces the
+	// environment's proxy URLs (NO_PROXY still applies).
 	fixed *url.URL
 
 	// ModeAuto: proxy for TLS / opaque TCP targets (HTTPS_PROXY, https_proxy,
@@ -68,6 +133,8 @@ type Resolver struct {
 	// their values are unusable (*EnvError each).
 	warnings []error
 }
+
+var emptyState proxyState
 
 // EnvError reports a proxy environment variable whose value cannot be used.
 // Its message names the variable and never includes the value's
@@ -92,7 +159,14 @@ func Off() *Resolver { return &Resolver{mode: ModeOff} }
 // scheme is taken as http. The port defaults to 80 for http and 443 for
 // https. Everything up to the last "@" is the userinfo, so credentials may
 // hold unescaped '/', '?', '#' or '@'; percent-escapes in them are decoded.
+//
+// The Resolver never changes; NewResolver with WithRefreshCommand builds
+// one whose credentials follow a refresh source.
 func Explicit(proxyURL string) (*Resolver, error) {
+	return newExplicit(proxyURL, options{})
+}
+
+func newExplicit(proxyURL string, o options) (*Resolver, error) {
 	if strings.TrimSpace(proxyURL) == "" {
 		return nil, errors.New("netproxy: empty proxy URL")
 	}
@@ -100,11 +174,14 @@ func Explicit(proxyURL string) (*Resolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Resolver{mode: ModeExplicit, fixed: u}, nil
+	r := &Resolver{mode: ModeExplicit}
+	r.state.Store(&proxyState{fixed: u})
+	r.configure(o)
+	return r, nil
 }
 
-// FromEnvironment returns a Resolver built from a snapshot of the
-// conventional proxy environment variables, taken now:
+// FromEnvironment returns a Resolver built from the conventional proxy
+// environment variables:
 //
 //   - TLS and raw TCP targets (ProxyForAddr, and https:// / wss:// requests)
 //     use the first usable one of HTTPS_PROXY, https_proxy, ALL_PROXY,
@@ -127,26 +204,47 @@ func Explicit(proxyURL string) (*Resolver, error) {
 // https_proxy, which explicitly names the TLS proxy, makes FromEnvironment
 // fail, with an *EnvError naming it.
 //
+// The variables are read now, and read again at most every
+// DefaultRefreshInterval and whenever a proxy rejects the credentials (see
+// Refresh), so a process whose environment is updated in place follows it.
+// A later reading that fails keeps the previous one.
+//
 // An environment with no usable proxy variables yields a Resolver that
-// never proxies (Enabled reports false). Neither errors nor warnings ever
+// does not proxy (Enabled reports false). Neither errors nor warnings ever
 // echo a value's credentials.
 func FromEnvironment() (*Resolver, error) {
-	return fromEnv(os.Getenv)
+	return newAuto(os.Getenv, options{})
 }
 
 func fromEnv(getenv func(string) string) (*Resolver, error) {
-	r := &Resolver{mode: ModeAuto}
+	return newAuto(getenv, options{})
+}
+
+func newAuto(getenv func(string) string, o options) (*Resolver, error) {
+	st, err := readEnv(getenv)
+	if err != nil {
+		return nil, err
+	}
+	r := &Resolver{mode: ModeAuto, getenv: getenv}
+	r.state.Store(st)
+	r.configure(o)
+	return r, nil
+}
+
+// readEnv reads the ModeAuto settings from the environment.
+func readEnv(getenv func(string) string) (*proxyState, error) {
+	st := &proxyState{}
 	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
 		u, err := envProxy(getenv, name)
 		if err != nil {
 			if name == "HTTPS_PROXY" || name == "https_proxy" {
 				return nil, err
 			}
-			r.warnings = append(r.warnings, err)
+			st.warnings = append(st.warnings, err)
 			continue
 		}
 		if u != nil {
-			r.secure = u
+			st.secure = u
 			break
 		}
 	}
@@ -157,17 +255,17 @@ func fromEnv(getenv func(string) string) (*Resolver, error) {
 	for _, name := range plainVars {
 		u, err := envProxy(getenv, name)
 		if err != nil {
-			r.warnings = append(r.warnings, err)
+			st.warnings = append(st.warnings, err)
 			continue
 		}
 		if u != nil {
-			r.plain = u
+			st.plain = u
 			break
 		}
 	}
-	r.noProxyRaw, _ = firstEnv(getenv, "NO_PROXY", "no_proxy")
-	r.noProxy = parseNoProxy(r.noProxyRaw)
-	return r, nil
+	st.noProxyRaw, _ = firstEnv(getenv, "NO_PROXY", "no_proxy")
+	st.noProxy = parseNoProxy(st.noProxyRaw)
+	return st, nil
 }
 
 // envProxy parses one proxy variable: nil, nil when it is unset or blank,
@@ -184,15 +282,16 @@ func envProxy(getenv func(string) string, name string) (*url.URL, error) {
 	return u, nil
 }
 
-// Warnings reports the proxy environment variables FromEnvironment skipped
-// because their values are unusable, one *EnvError per variable, in
-// precedence order. It is empty for other Resolvers. The messages are safe
-// to log.
+// Warnings reports the proxy environment variables the current reading of
+// the environment skipped because their values are unusable, one *EnvError
+// per variable, in precedence order. It is empty for Resolvers that do not
+// read the environment. The messages are safe to log.
 func (r *Resolver) Warnings() []error {
-	if r == nil || len(r.warnings) == 0 {
+	st := r.snapshot()
+	if len(st.warnings) == 0 {
 		return nil
 	}
-	return append([]error(nil), r.warnings...)
+	return append([]error(nil), st.warnings...)
 }
 
 // Parse builds a Resolver from a -proxy style setting: "auto" (or "") reads
@@ -200,15 +299,35 @@ func (r *Resolver) Warnings() []error {
 // else is an explicit proxy URL (see Explicit). Deciding whether "auto"
 // applies at all (for example only in a TCP-only transport mode) is the
 // caller's policy; compare the setting against ModeAuto for that.
+//
+// Parse(spec) is NewResolver(spec) without options.
 func Parse(spec string) (*Resolver, error) {
+	return NewResolver(spec)
+}
+
+// NewResolver is Parse with options, for example a refresh command for
+// proxies that rotate their credentials:
+//
+//	r, err := netproxy.NewResolver(spec,
+//		netproxy.WithRefreshCommand(os.Getenv(netproxy.EnvRefreshCommand)),
+//		netproxy.WithRefreshErrorHandler(func(err error) {
+//			slog.Warn("proxy credential refresh failed", "err", err)
+//		}))
+//
+// Options do not apply to "off". With a refresh source, NewResolver runs it
+// once before returning; if that run fails, the Resolver starts from the
+// environment ("auto") or the given URL, and the error goes to the
+// WithRefreshErrorHandler function.
+func NewResolver(spec string, opts ...Option) (*Resolver, error) {
+	o := newOptions(opts)
 	s := strings.TrimSpace(spec)
 	switch strings.ToLower(s) {
 	case "", ModeAuto:
-		return FromEnvironment()
+		return newAuto(os.Getenv, o)
 	case ModeOff:
 		return Off(), nil
 	}
-	return Explicit(s)
+	return newExplicit(s, o)
 }
 
 // Mode reports ModeAuto, ModeOff or ModeExplicit. A nil Resolver is ModeOff.
@@ -221,53 +340,76 @@ func (r *Resolver) Mode() string {
 
 // Enabled reports whether the Resolver can route any target through a proxy.
 // It is false for Off, for a nil Resolver and for an environment without
-// proxy variables.
+// proxy variables. A Resolver with a refresh source reports true: the
+// source can supply a proxy at any time.
 func (r *Resolver) Enabled() bool {
 	if r == nil {
 		return false
 	}
 	switch r.mode {
-	case ModeExplicit:
-		return r.fixed != nil
-	case ModeAuto:
-		return r.secure != nil || r.plain != nil
+	case ModeExplicit, ModeAuto:
+		return r.source != nil || r.snapshot().proxies()
 	}
 	return false
+}
+
+// proxies reports whether st routes anything through a proxy.
+func (st *proxyState) proxies() bool {
+	return st.fixed != nil || st.secure != nil || st.plain != nil
 }
 
 // String describes the Resolver for logs, with credentials redacted, e.g.
 // "off", "http://***@proxy.internal:3128" or
 // "auto: http://***@proxy.internal:3128 (NO_PROXY=localhost,.corp)".
+// Resolvers with a refresh source add " (credentials refreshed by
+// command)" or " (credentials refreshed by callback)".
 func (r *Resolver) String() string {
+	st := r.snapshot()
 	switch r.Mode() {
 	case ModeExplicit:
-		return Redact(r.fixed)
+		return Redact(st.fixed) + r.refreshSuffix()
 	case ModeAuto:
-		if !r.Enabled() {
-			return "auto: no proxy in environment" + r.ignoredSuffix()
+		if !st.proxies() {
+			return "auto: no proxy in environment" + st.ignoredSuffix() + r.refreshSuffix()
 		}
-		s := "auto: " + Redact(r.secure)
-		if r.secure == nil {
-			s = "auto: http-only " + Redact(r.plain)
-		} else if r.plain != nil && Redact(r.plain) != Redact(r.secure) {
-			s += ", http " + Redact(r.plain)
+		var s string
+		switch {
+		case st.fixed != nil:
+			s = "auto: " + Redact(st.fixed)
+		case st.secure == nil:
+			s = "auto: http-only " + Redact(st.plain)
+		default:
+			s = "auto: " + Redact(st.secure)
+			if st.plain != nil && Redact(st.plain) != Redact(st.secure) {
+				s += ", http " + Redact(st.plain)
+			}
 		}
-		if r.noProxyRaw != "" {
-			s += " (NO_PROXY=" + r.noProxyRaw + ")"
+		if st.noProxyRaw != "" {
+			s += " (NO_PROXY=" + st.noProxyRaw + ")"
 		}
-		return s + r.ignoredSuffix()
+		return s + st.ignoredSuffix() + r.refreshSuffix()
 	}
 	return ModeOff
 }
 
+func (r *Resolver) refreshSuffix() string {
+	switch {
+	case r.source == nil:
+		return ""
+	case r.command:
+		return " (credentials refreshed by command)"
+	}
+	return " (credentials refreshed by callback)"
+}
+
 // ignoredSuffix names the skipped variables for String, e.g.
 // " (ignored unusable HTTP_PROXY, ALL_PROXY)".
-func (r *Resolver) ignoredSuffix() string {
-	if len(r.warnings) == 0 {
+func (st *proxyState) ignoredSuffix() string {
+	if len(st.warnings) == 0 {
 		return ""
 	}
-	names := make([]string, 0, len(r.warnings))
-	for _, w := range r.warnings {
+	names := make([]string, 0, len(st.warnings))
+	for _, w := range st.warnings {
 		var ee *EnvError
 		if errors.As(w, &ee) {
 			names = append(names, ee.Var)
@@ -278,19 +420,32 @@ func (r *Resolver) ignoredSuffix() string {
 
 // ProxyForAddr returns the proxy to tunnel a raw TCP (or TLS) connection to
 // addr ("host:port") through, or nil to dial directly. addr is inspected as
-// text only; host names are never resolved.
+// text only; host names are never resolved. When the refresh interval has
+// passed, the lookup first refreshes the settings (see Refresh).
 func (r *Resolver) ProxyForAddr(addr string) (*url.URL, error) {
-	if !r.Enabled() {
+	return r.proxyForAddr(context.Background(), addr)
+}
+
+func (r *Resolver) proxyForAddr(ctx context.Context, addr string) (*url.URL, error) {
+	// current first: a refresh can turn proxying on (a variable set in
+	// place, a refresh source's first URL).
+	st := r.current(ctx)
+	if !st.proxies() {
 		return nil, nil
 	}
+	return r.pickAddr(st, addr)
+}
+
+// pickAddr applies st to a raw TCP target.
+func (r *Resolver) pickAddr(st *proxyState, addr string) (*url.URL, error) {
 	if r.mode == ModeExplicit {
-		return cloneURL(r.fixed), nil
+		return cloneURL(st.fixed), nil
 	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("netproxy: invalid target address %q: %w", addr, err)
 	}
-	return cloneURL(r.pick(host, port, true)), nil
+	return cloneURL(st.pick(host, port, true)), nil
 }
 
 // ProxyForRequest returns the proxy for req, or nil for a direct connection.
@@ -300,13 +455,24 @@ func (r *Resolver) ProxyForAddr(addr string) (*url.URL, error) {
 //
 // https:// and wss:// requests follow exactly the same rules as ProxyForAddr
 // (net/http then tunnels them with CONNECT, sending the host name); http://
-// and ws:// requests prefer HTTP_PROXY in ModeAuto.
+// and ws:// requests prefer HTTP_PROXY in ModeAuto. The result is always
+// the current (refreshed) proxy URL; RefreshingTransport also retries a
+// request once when the proxy rejects the credentials.
 func (r *Resolver) ProxyForRequest(req *http.Request) (*url.URL, error) {
-	if !r.Enabled() || req == nil || req.URL == nil {
+	if req == nil || req.URL == nil {
 		return nil, nil
 	}
+	st := r.current(req.Context())
+	if !st.proxies() {
+		return nil, nil
+	}
+	return r.pickRequest(st, req), nil
+}
+
+// pickRequest applies st to an HTTP request.
+func (r *Resolver) pickRequest(st *proxyState, req *http.Request) *url.URL {
 	if r.mode == ModeExplicit {
-		return cloneURL(r.fixed), nil
+		return cloneURL(st.fixed)
 	}
 	secure := true
 	defaultPort := "443"
@@ -319,16 +485,19 @@ func (r *Resolver) ProxyForRequest(req *http.Request) (*url.URL, error) {
 	if port == "" {
 		port = defaultPort
 	}
-	return cloneURL(r.pick(req.URL.Hostname(), port, secure)), nil
+	return cloneURL(st.pick(req.URL.Hostname(), port, secure))
 }
 
 // pick applies the ModeAuto rules to one target.
-func (r *Resolver) pick(host, port string, secure bool) *url.URL {
-	proxy := r.secure
-	if !secure && r.plain != nil {
-		proxy = r.plain
+func (st *proxyState) pick(host, port string, secure bool) *url.URL {
+	proxy := st.secure
+	switch {
+	case st.fixed != nil:
+		proxy = st.fixed
+	case !secure && st.plain != nil:
+		proxy = st.plain
 	}
-	if proxy == nil || !r.noProxy.useProxy(host, port) {
+	if proxy == nil || !st.noProxy.useProxy(host, port) {
 		return nil
 	}
 	return proxy
