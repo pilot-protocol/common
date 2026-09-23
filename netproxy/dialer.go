@@ -36,14 +36,26 @@ const DefaultTimeout = 30 * time.Second
 // never resolved locally, so it works when local DNS for the target is
 // broken or poisoned. Callers that want TLS wrap the returned conn with
 // tls.Client themselves; TLS then runs end-to-end with the real server.
+//
+// When the proxy rejects the credentials (407 Proxy Authentication
+// Required, or a CONNECT response so garbled it cannot be parsed, which is
+// how some proxies' rejections arrive), the Dialer refreshes the Resolver
+// (see Resolver.Refresh) and, if that produced different credentials,
+// retries once on a new connection. Tunnels opened earlier are never
+// touched. A Resolver with nothing to refresh gets no retry.
+//
+// Errors never quote the proxy's response: a 407 or other refusal is a
+// *ConnectError, and a response that cannot be parsed is reported by what
+// was wrong with it ("malformed HTTP status code", say) without its text.
 type Dialer struct {
 	// Resolver picks the proxy per target. nil never proxies.
 	Resolver *Resolver
 
 	// Timeout bounds the whole establishment: the TCP connect to the proxy
 	// (or to the target when dialing directly), the TLS handshake with an
-	// https:// proxy, and the CONNECT exchange. Zero means DefaultTimeout.
-	// An earlier deadline on the DialContext context wins.
+	// https:// proxy, and the CONNECT exchange, including a credential
+	// refresh and the one retry after a rejection. Zero means
+	// DefaultTimeout. An earlier deadline on the DialContext context wins.
 	Timeout time.Duration
 
 	// Forward dials the proxy itself, and the target when no proxy applies.
@@ -97,6 +109,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Noted before the pick, so a timed refresh the pick itself starts
+	// counts as having happened after it (see Resolver.reauth).
+	start := resolver.attemptCount()
 	proxyURL, err := resolver.ProxyForAddr(addr)
 	if err != nil {
 		return nil, err
@@ -109,7 +124,88 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	default:
 		return nil, fmt.Errorf("netproxy: cannot tunnel network %q through proxy %s", network, Redact(proxyURL))
 	}
-	return d.dialConnect(ctx, proxyURL, addr)
+	conn, err := d.dialConnect(ctx, proxyURL, addr)
+	if err == nil || !credentialsRejected(err) {
+		return conn, err
+	}
+	next, retry, refreshErr := resolver.reauth(ctx, start, proxyURL, func(st *proxyState) *url.URL {
+		u, _ := resolver.pickAddr(st, addr) // addr already parsed once
+		return u
+	})
+	if !retry {
+		return nil, withRefreshError(err, refreshErr)
+	}
+	if next == nil {
+		// The refreshed settings no longer proxy this target.
+		return d.forward(ctx, network, addr)
+	}
+	return d.dialConnect(ctx, next, addr)
+}
+
+// credentialsRejected reports whether a CONNECT failed in a way stale
+// credentials explain: a 407, or a response that could not be parsed.
+func credentialsRejected(err error) bool {
+	var ce *ConnectError
+	if errors.As(err, &ce) {
+		return ce.StatusCode == http.StatusProxyAuthRequired
+	}
+	var bad *badConnectResponse
+	return errors.As(err, &bad)
+}
+
+// badConnectResponse is a CONNECT response that could not be parsed (as
+// opposed to an I/O error while reading it). It keeps only what was wrong
+// with the response: net/http's own message quotes the offending bytes,
+// and a proxy can fill those with whatever it likes, including the
+// Proxy-Authorization it was sent.
+type badConnectResponse struct {
+	// what is a fixed description, e.g. "malformed HTTP status code".
+	what string
+}
+
+func (e *badConnectResponse) Error() string {
+	return "read CONNECT response: " + e.what + " (response text withheld)"
+}
+
+// responseFaults are net/http's (and net/textproto's) complaints about a
+// response http.ReadResponse cannot parse, most specific first. Their
+// messages go on to quote the offending text, which is why only these
+// fixed descriptions are ever kept.
+var responseFaults = []string{
+	"malformed HTTP status code",
+	"malformed HTTP response",
+	"malformed HTTP version",
+	"malformed MIME header initial line",
+	"malformed MIME header line",
+	"malformed MIME header",
+	"invalid empty Content-Length",
+	"bad Content-Length",
+	"multiple Content-Length headers",
+	"too many transfer encodings",
+	"unsupported transfer encoding",
+	"invalid Trailer key",
+}
+
+// responseFault returns which of responseFaults err reports, or "" if none.
+func responseFault(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	for _, fault := range responseFaults {
+		if strings.Contains(msg, fault) {
+			return fault
+		}
+	}
+	return ""
+}
+
+// isReadError reports whether err is a failure to read (the connection
+// closing, timing out or breaking) rather than a complaint about what was
+// read. Such errors carry no text from the peer.
+func isReadError(err error) bool {
+	var ne net.Error
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &ne)
 }
 
 func (d *Dialer) forward(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -200,7 +296,15 @@ func (d *Dialer) connect(ctx context.Context, conn net.Conn, proxyURL *url.URL, 
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
-		return nil, fmt.Errorf("read CONNECT response: %w", err)
+		if isReadError(err) {
+			return nil, fmt.Errorf("read CONNECT response: %w", err)
+		}
+		// Anything else is about the bytes the proxy sent, and quotes them.
+		what := responseFault(err)
+		if what == "" {
+			what = "unparseable response"
+		}
+		return nil, &badConnectResponse{what: what}
 	}
 	// The body is never read: on success the rest of the stream belongs to
 	// the tunnel, and on failure the conn is discarded.
