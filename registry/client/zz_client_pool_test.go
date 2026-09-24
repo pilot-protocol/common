@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"strings"
@@ -287,41 +288,42 @@ func TestDialPoolErrorOnUnreachable(t *testing.T) {
 
 // TestDialPoolPartialSecondaryFailureClosesPrimary covers the
 // "primary dialed, secondary dial failed → close primary, return err" branch
-// inside initPool. We accept the primary conn then close the listener to make
-// secondary dials fail.
+// inside initPool. The dialer fails the third dial (the second secondary),
+// so the failure is deterministic: closing the listener after the first
+// accept raced the secondary dials, which could still land in the backlog.
 func TestDialPoolPartialSecondaryFailureClosesPrimary(t *testing.T) {
 	t.Parallel()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
+	srv := newFakeJSONServer(t, echoHandler())
+	defer srv.close()
 
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+	boom := errors.New("secondary dial refused")
+	var opened []*countingConn
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if len(opened) == 2 {
+			return nil, boom
 		}
-		accepted <- conn
-		// Close listener immediately so the next net.Dial inside initPool
-		// fails with ECONNREFUSED.
-		ln.Close()
-	}()
+		var d net.Dialer
+		raw, err := d.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		cc := &countingConn{Conn: raw}
+		opened = append(opened, cc)
+		return cc, nil
+	}
 
-	_, err = DialPool(addr, 4)
+	_, err := DialPool(srv.addr(), 4, WithDialer(dial))
 	if err == nil {
 		t.Fatalf("expected DialPool to fail when secondary dial errors")
 	}
-	if !strings.Contains(err.Error(), "dial pool conn") {
-		t.Fatalf("error should mention dial pool conn, got: %v", err)
+	if !strings.Contains(err.Error(), "dial pool conn 2") || !errors.Is(err, boom) {
+		t.Fatalf("error should wrap the secondary dial failure, got: %v", err)
 	}
-
-	// Clean up the primary conn that the server accepted.
-	select {
-	case c := <-accepted:
-		c.Close()
-	case <-time.After(time.Second):
+	// The primary and the secondary that did open are both closed.
+	for i, cc := range opened {
+		if n := cc.closes.Load(); n != 1 {
+			t.Fatalf("conn %d closed %d times, want 1", i, n)
+		}
 	}
 }
 
@@ -480,7 +482,7 @@ func TestReconnectEntrySyncsPrimary(t *testing.T) {
 	oldConn := c.conn
 	primary.mu.Lock()
 	_ = primary.conn.Close()
-	if err := c.reconnectEntry(context.Background(), primary); err != nil {
+	if err := c.reconnectEntry(context.Background(), primary, nil); err != nil {
 		primary.mu.Unlock()
 		t.Fatalf("reconnectEntry: %v", err)
 	}
@@ -515,7 +517,7 @@ func TestReconnectEntryFailsWhenClosed(t *testing.T) {
 	}
 	c.Close()
 
-	if err := c.reconnectEntry(context.Background(), c.pool.entries[0]); err == nil {
+	if err := c.reconnectEntry(context.Background(), c.pool.entries[0], nil); err == nil {
 		t.Fatalf("reconnectEntry on closed client should fail")
 	}
 }
