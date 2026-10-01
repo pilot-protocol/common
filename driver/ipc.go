@@ -79,6 +79,14 @@ const (
 	cmdSignEnvelopeOK   byte = 0x34
 	cmdVerifyEnvelope   byte = 0x35
 	cmdVerifyEnvelopeOK byte = 0x36
+	// 0x37/0x38 are the daemon's CmdUnbind/CmdUnbindOK.
+	//
+	// cmdSendToConfirm is cmdSendTo with a reply: cmdSendToOK once the
+	// daemon has handed the datagram to its tunnel, cmdError when it could
+	// not send it. Daemons that support it list "dgram_confirm" in the info
+	// reply's features; older daemons reply cmdError "unknown command".
+	cmdSendToConfirm byte = 0x39
+	cmdSendToOK      byte = 0x3A
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)
@@ -243,7 +251,7 @@ func (c *ipcClient) readLoop() {
 			cmdDeregisterOK, cmdSetTagsOK, cmdSetWebhookOK, cmdNetworkOK,
 			cmdHealthOK, cmdManagedOK, cmdRotateKeyOK, cmdBroadcastOK,
 			cmdPreferDirectOK, cmdSubmitBadgeOK, cmdEnrollRecoveryOK,
-			cmdSignEnvelopeOK, cmdVerifyEnvelopeOK:
+			cmdSignEnvelopeOK, cmdVerifyEnvelopeOK, cmdSendToOK:
 			// Known response cmds: deliver to the active sendAndWait waiter.
 			// If there is no active waiter (the request timed out / was
 			// abandoned, or this is a duplicate), the reply is dropped —
