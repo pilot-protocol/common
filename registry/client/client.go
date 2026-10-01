@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1206,6 +1208,131 @@ func (c *Client) LeaveNetwork(nodeID uint32, networkID uint16, adminToken string
 	return c.Send(msg)
 }
 
+// signRoleClaim adds the signature a registry requires before it will act
+// on the role of msg["node_id"] in a network (delete/rename/kick/promote/
+// demote/transfer_ownership/set_member_tags/set_network_policy/
+// set_expr_policy). It is a no-op when msg names no node or no signer is
+// configured: the request then goes out as before and is authorized by its
+// admin_token, if any. A registry that predates the requirement ignores the
+// extra field.
+func (c *Client) signRoleClaim(msg map[string]interface{}) {
+	challenge, ok := networkRoleChallenge(msg)
+	if !ok {
+		return
+	}
+	if sig, err := c.sign(challenge); err == nil {
+		msg["signature"] = sig
+	}
+}
+
+// networkRoleChallenge returns the string the registry verifies for the
+// role-gated request msg, and false when msg carries no node_id to sign as.
+// It mirrors authz.NetworkRoleChallenge in the rendezvous module; the two
+// are pinned to each other by the same golden vectors in both modules:
+//
+//	delete_network:<node>:<net>
+//	rename_network:<node>:<net>:<name>
+//	kick_member | promote_member | demote_member:<node>:<net>:<target_node_id>
+//	transfer_ownership:<node>:<net>:<new_owner_id>
+//	set_member_tags:<node>:<net>:<target_node_id>:<hex sha256 of tags joined by ",">
+//	set_network_policy:<node>:<net>:<hex sha256 of networkPolicyDigestInput>
+//	set_expr_policy:<node>:<net>:<hex sha256 of the expr_policy string>
+//
+// The challenge is computed over msg as the registry will decode it, so the
+// request is round-tripped through JSON first.
+func networkRoleChallenge(msg map[string]interface{}) (string, bool) {
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return "", false
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return "", false
+	}
+	nodeID := roleUint(m, "node_id", 1<<32-1)
+	if nodeID == 0 {
+		return "", false
+	}
+	msgType, _ := m["type"].(string)
+	base := fmt.Sprintf("%s:%d:%d", msgType, nodeID, roleUint(m, "network_id", 1<<16-1))
+	switch msgType {
+	case "rename_network":
+		name, _ := m["name"].(string)
+		return base + ":" + name, true
+	case "kick_member", "promote_member", "demote_member":
+		return fmt.Sprintf("%s:%d", base, roleUint(m, "target_node_id", 1<<32-1)), true
+	case "transfer_ownership":
+		return fmt.Sprintf("%s:%d", base, roleUint(m, "new_owner_id", 1<<32-1)), true
+	case "set_member_tags":
+		var tags []string
+		if rawTags, ok := m["tags"].([]interface{}); ok {
+			for _, rt := range rawTags {
+				if t, ok := rt.(string); ok {
+					tags = append(tags, t)
+				}
+			}
+		}
+		return fmt.Sprintf("%s:%d:%s", base, roleUint(m, "target_node_id", 1<<32-1), roleHexSHA256(strings.Join(tags, ","))), true
+	case "set_network_policy":
+		return base + ":" + roleHexSHA256(networkPolicyDigestInput(m)), true
+	case "set_expr_policy":
+		var expr string
+		switch v := m["expr_policy"].(type) {
+		case string:
+			expr = v
+		case map[string]interface{}:
+			b, _ := json.Marshal(v)
+			expr = string(b)
+		}
+		return base + ":" + roleHexSHA256(expr), true
+	}
+	return base, true
+}
+
+// networkPolicyDigestInput is the canonical form of the three fields a
+// set_network_policy request may carry, as decoded from JSON: an absent
+// field is "-", a present one is "=" followed by its value.
+func networkPolicyDigestInput(m map[string]interface{}) string {
+	maxMembers := "-"
+	if v, ok := m["max_members"].(float64); ok {
+		maxMembers = "=" + strconv.FormatFloat(v, 'f', -1, 64)
+	}
+	ports := "-"
+	if v, ok := m["allowed_ports"].([]interface{}); ok {
+		parts := make([]string, len(v))
+		for i, p := range v {
+			if f, ok := p.(float64); ok {
+				parts[i] = strconv.FormatFloat(f, 'f', -1, 64)
+			} else {
+				parts[i] = "?"
+			}
+		}
+		ports = "=" + strings.Join(parts, ",")
+	}
+	description := "-"
+	if v, ok := m["description"].(string); ok {
+		description = "=" + v
+	}
+	return "max_members" + maxMembers + "\nallowed_ports" + ports + "\ndescription" + description
+}
+
+// roleUint reads a JSON number the way the registry does: values outside
+// [0, max] are 0.
+func roleUint(m map[string]interface{}, key string, max float64) uint64 {
+	v, ok := m[key].(float64)
+	if !ok || v < 0 || v > max {
+		return 0
+	}
+	return uint64(v)
+}
+
+func roleHexSHA256(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+// DeleteNetwork deletes a network. Authorized by adminToken, or — when
+// nodeID is given and a signer is configured — by that node's owner role.
 func (c *Client) DeleteNetwork(networkID uint16, adminToken string, nodeID ...uint32) (map[string]interface{}, error) {
 	msg := map[string]interface{}{
 		"type":       "delete_network",
@@ -1217,9 +1344,12 @@ func (c *Client) DeleteNetwork(networkID uint16, adminToken string, nodeID ...ui
 	if len(nodeID) > 0 && nodeID[0] != 0 {
 		msg["node_id"] = nodeID[0]
 	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
+// RenameNetwork renames a network. Authorized by adminToken, or — when
+// nodeID is given and a signer is configured — by that node's owner/admin role.
 func (c *Client) RenameNetwork(networkID uint16, name, adminToken string, nodeID ...uint32) (map[string]interface{}, error) {
 	msg := map[string]interface{}{
 		"type":       "rename_network",
@@ -1232,6 +1362,7 @@ func (c *Client) RenameNetwork(networkID uint16, name, adminToken string, nodeID
 	if len(nodeID) > 0 && nodeID[0] != 0 {
 		msg["node_id"] = nodeID[0]
 	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
@@ -1482,6 +1613,7 @@ func (c *Client) PromoteMember(networkID uint16, nodeID, targetNodeID uint32, ad
 	if adminToken != "" {
 		msg["admin_token"] = adminToken
 	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
@@ -1496,6 +1628,7 @@ func (c *Client) DemoteMember(networkID uint16, nodeID, targetNodeID uint32, adm
 	if adminToken != "" {
 		msg["admin_token"] = adminToken
 	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
@@ -1510,6 +1643,7 @@ func (c *Client) KickMember(networkID uint16, nodeID, targetNodeID uint32, admin
 	if adminToken != "" {
 		msg["admin_token"] = adminToken
 	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
@@ -1524,6 +1658,7 @@ func (c *Client) TransferOwnership(networkID uint16, ownerNodeID, newOwnerID uin
 	if adminToken != "" {
 		msg["admin_token"] = adminToken
 	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
@@ -1536,7 +1671,20 @@ func (c *Client) GetMemberRole(networkID uint16, targetNodeID uint32) (map[strin
 	})
 }
 
-// SetNetworkPolicy sets or updates a network's policy. Requires owner/admin role or admin token.
+// SetNetworkPolicyAs is SetNetworkPolicy authorized by nodeID's owner/admin
+// role in the network: the request names the node and is signed by the
+// configured signer. adminToken may be empty.
+func (c *Client) SetNetworkPolicyAs(nodeID uint32, networkID uint16, policy map[string]interface{}, adminToken string) (map[string]interface{}, error) {
+	withNode := make(map[string]interface{}, len(policy)+1)
+	for k, v := range policy {
+		withNode[k] = v
+	}
+	withNode["node_id"] = nodeID
+	return c.SetNetworkPolicy(networkID, withNode, adminToken)
+}
+
+// SetNetworkPolicy sets or updates a network's policy. Requires an admin
+// token; to act on a node's owner/admin role instead, use SetNetworkPolicyAs.
 func (c *Client) SetNetworkPolicy(networkID uint16, policy map[string]interface{}, adminToken string) (map[string]interface{}, error) {
 	msg := map[string]interface{}{}
 	for k, v := range policy {
@@ -1547,6 +1695,7 @@ func (c *Client) SetNetworkPolicy(networkID uint16, policy map[string]interface{
 	if adminToken != "" {
 		msg["admin_token"] = adminToken
 	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
@@ -1558,9 +1707,18 @@ func (c *Client) GetNetworkPolicy(networkID uint16) (map[string]interface{}, err
 	})
 }
 
-// SetExprPolicy sets the programmable policy for a network.
-// Requires owner/admin role or admin token.
+// SetExprPolicy sets the programmable policy for a network. Requires an
+// admin token; to act on a node's owner/admin role instead, use
+// SetExprPolicyAs.
 func (c *Client) SetExprPolicy(networkID uint16, policyJSON json.RawMessage, adminToken string) (map[string]interface{}, error) {
+	return c.SetExprPolicyAs(0, networkID, policyJSON, adminToken)
+}
+
+// SetExprPolicyAs is SetExprPolicy authorized by nodeID's owner/admin role
+// in the network: the request names the node and is signed by the
+// configured signer. adminToken may be empty. A zero nodeID sends the
+// request exactly as SetExprPolicy always has.
+func (c *Client) SetExprPolicyAs(nodeID uint32, networkID uint16, policyJSON json.RawMessage, adminToken string) (map[string]interface{}, error) {
 	msg := map[string]interface{}{
 		"type":        "set_expr_policy",
 		"network_id":  networkID,
@@ -1569,6 +1727,10 @@ func (c *Client) SetExprPolicy(networkID uint16, policyJSON json.RawMessage, adm
 	if adminToken != "" {
 		msg["admin_token"] = adminToken
 	}
+	if nodeID != 0 {
+		msg["node_id"] = nodeID
+	}
+	c.signRoleClaim(msg)
 	return c.Send(msg)
 }
 
@@ -1636,14 +1798,29 @@ func (c *Client) SetTagsAdmin(nodeID uint32, tags []string, adminToken string) (
 }
 
 // SetMemberTags sets admin-assigned tags for a member within a network.
+// Requires an admin token; to act on a node's owner/admin role instead, use
+// SetMemberTagsAs.
 func (c *Client) SetMemberTags(netID uint16, targetNodeID uint32, tags []string, adminToken string) (map[string]interface{}, error) {
-	return c.Send(map[string]interface{}{
+	return c.SetMemberTagsAs(0, netID, targetNodeID, tags, adminToken)
+}
+
+// SetMemberTagsAs is SetMemberTags authorized by nodeID's owner/admin role
+// in the network: the request names the node and is signed by the
+// configured signer. adminToken may be empty. A zero nodeID sends the
+// request exactly as SetMemberTags always has.
+func (c *Client) SetMemberTagsAs(nodeID uint32, netID uint16, targetNodeID uint32, tags []string, adminToken string) (map[string]interface{}, error) {
+	msg := map[string]interface{}{
 		"type":           "set_member_tags",
 		"network_id":     netID,
 		"target_node_id": targetNodeID,
 		"tags":           tags,
 		"admin_token":    adminToken,
-	})
+	}
+	if nodeID != 0 {
+		msg["node_id"] = nodeID
+	}
+	c.signRoleClaim(msg)
+	return c.Send(msg)
 }
 
 // GetMemberTags returns admin-assigned member tags for a node (or all members if targetNodeID=0).
