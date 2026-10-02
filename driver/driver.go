@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pilot-protocol/common/protocol"
@@ -64,6 +66,11 @@ func (d *Driver) jsonRPC(msg []byte, expectCmd byte, label string) (map[string]i
 type Driver struct {
 	ipc        *ipcClient
 	socketPath string
+
+	// noDgramConfirm is set once the daemon has answered cmdSendToConfirm
+	// with "unknown command", so later SendToConfirmed calls go straight
+	// to the legacy send instead of probing again.
+	noDgramConfirm atomic.Bool
 }
 
 // Connect creates a new driver connected to the local daemon.
@@ -171,6 +178,46 @@ func (d *Driver) SendTo(dst protocol.Addr, port uint16, data []byte) error {
 	binary.BigEndian.PutUint16(msg[1+protocol.AddrSize:], port)
 	copy(msg[1+protocol.AddrSize+2:], data)
 	return d.ipc.send(msg)
+}
+
+// SendToConfirmed sends an unreliable unicast datagram like SendTo, and
+// waits for the daemon to say whether it sent it.
+//
+//   - (true, nil): the daemon handed the datagram to its tunnel. Datagrams
+//     are unreliable, so this still says nothing about delivery to the peer.
+//   - (false, err): the daemon could not send it (no route to the node, port
+//     policy, ephemeral ports exhausted, ...), or did not answer in time —
+//     in which case the datagram may or may not have left.
+//   - (false, nil): the daemon predates confirmed sends (no "dgram_confirm"
+//     feature). The datagram was written with the legacy fire-and-forget
+//     command, exactly as SendTo does, and its outcome is unknown.
+//
+// Unlike SendTo this is a request/reply exchange, and a Driver runs one of
+// those at a time: a confirmed send waits behind an in-flight Dial on the
+// same Driver. Use SendTo where throughput matters more than the outcome.
+func (d *Driver) SendToConfirmed(dst protocol.Addr, port uint16, data []byte) (confirmed bool, err error) {
+	if dst.IsBroadcast() {
+		return false, fmt.Errorf("broadcast address requires admin token: use Driver.Broadcast")
+	}
+	if d.noDgramConfirm.Load() {
+		return false, d.SendTo(dst, port, data)
+	}
+	msg := make([]byte, 1+protocol.AddrSize+2+len(data))
+	msg[0] = cmdSendToConfirm
+	dst.MarshalTo(msg, 1)
+	binary.BigEndian.PutUint16(msg[1+protocol.AddrSize:], port)
+	copy(msg[1+protocol.AddrSize+2:], data)
+
+	if _, err := d.ipc.sendAndWaitTimeout(msg, cmdSendToOK, defaultDialTimeout); err != nil {
+		if strings.Contains(err.Error(), fmt.Sprintf("unknown command: 0x%02X", cmdSendToConfirm)) {
+			// Older daemon: it rejected the command without sending
+			// anything, so fall back to the send it does understand.
+			d.noDgramConfirm.Store(true)
+			return false, d.SendTo(dst, port, data)
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // Broadcast fans an unreliable datagram out to every member of a network.
