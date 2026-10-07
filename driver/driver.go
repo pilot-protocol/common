@@ -5,10 +5,13 @@ package driver
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pilot-protocol/common/protocol"
@@ -64,6 +67,11 @@ func (d *Driver) jsonRPC(msg []byte, expectCmd byte, label string) (map[string]i
 type Driver struct {
 	ipc        *ipcClient
 	socketPath string
+
+	// noDgramConfirm is set once the daemon has answered cmdSendToConfirm
+	// with "unknown command", so later SendToConfirmed calls go straight
+	// to the legacy send instead of probing again.
+	noDgramConfirm atomic.Bool
 }
 
 // Connect creates a new driver connected to the local daemon.
@@ -172,6 +180,74 @@ func (d *Driver) SendTo(dst protocol.Addr, port uint16, data []byte) error {
 	copy(msg[1+protocol.AddrSize+2:], data)
 	return d.ipc.send(msg)
 }
+
+// SendToConfirmed sends an unreliable unicast datagram like SendTo, and
+// waits for the daemon to say whether it sent it.
+//
+//   - (true, nil): the daemon handed the datagram to its tunnel. Datagrams
+//     are unreliable, so this still says nothing about delivery to the peer.
+//   - (false, err): the daemon could not send it (no route to the node, port
+//     policy, ephemeral ports exhausted, ...), or did not answer in time
+//     (ErrConfirmTimeout: the datagram may or may not have left), or this
+//     call never got its turn (ErrConfirmQueueTimeout: nothing was sent).
+//   - (false, nil): the daemon predates confirmed sends (no "dgram_confirm"
+//     feature). The datagram was written with the legacy fire-and-forget
+//     command, exactly as SendTo does, and its outcome is unknown.
+//
+// Unlike SendTo this is a request/reply exchange, and a Driver runs one of
+// those at a time: a confirmed send waits behind an in-flight Dial on the
+// same Driver. Use SendTo where throughput matters more than the outcome.
+//
+// When the daemon does not answer in time, the next confirmed send on this
+// Driver waits until that late answer has arrived: with no request IDs on the
+// IPC, that is what keeps it from being taken as the next one's answer. Other
+// requests are not held up.
+func (d *Driver) SendToConfirmed(dst protocol.Addr, port uint16, data []byte) (confirmed bool, err error) {
+	if dst.IsBroadcast() {
+		return false, fmt.Errorf("broadcast address requires admin token: use Driver.Broadcast")
+	}
+	if d.noDgramConfirm.Load() {
+		return false, d.SendTo(dst, port, data)
+	}
+	msg := make([]byte, 1+protocol.AddrSize+2+len(data))
+	msg[0] = cmdSendToConfirm
+	dst.MarshalTo(msg, 1)
+	binary.BigEndian.PutUint16(msg[1+protocol.AddrSize:], port)
+	copy(msg[1+protocol.AddrSize+2:], data)
+
+	resp, err := d.ipc.sendConfirmAndWait(msg, sendToConfirmTimeout, sendToConfirmTimeout)
+	if err != nil {
+		return false, err
+	}
+	if resp.cmd == cmdSendToOK {
+		return true, nil
+	}
+	text := ""
+	if len(resp.payload) >= 2 {
+		text = string(resp.payload[2:])
+	}
+	if strings.HasPrefix(text, fmt.Sprintf("unknown command: 0x%02X", cmdSendToConfirm)) {
+		// Older daemon: it rejected the command without sending anything,
+		// so fall back to the send it does understand.
+		d.noDgramConfirm.Store(true)
+		return false, d.SendTo(dst, port, data)
+	}
+	return false, fmt.Errorf("daemon: %s", text)
+}
+
+// sendToConfirmTimeout bounds how long SendToConfirmed waits for its turn on
+// the Driver, and then for the daemon's answer. A variable so tests can
+// shorten it.
+var sendToConfirmTimeout = defaultDialTimeout
+
+// ErrConfirmTimeout is returned by SendToConfirmed when the daemon did not
+// answer in time. The datagram may or may not have been sent.
+var ErrConfirmTimeout = errors.New("datagram send not confirmed: the daemon did not answer in time; it may or may not have been sent")
+
+// ErrConfirmQueueTimeout is returned by SendToConfirmed when it waited too
+// long for its turn on the Driver: behind other requests, or for an earlier
+// confirmed send's late answer. Nothing was sent.
+var ErrConfirmQueueTimeout = errors.New("datagram not sent: timed out waiting for this Driver's earlier requests to be answered")
 
 // Broadcast fans an unreliable datagram out to every member of a network.
 // The admin token must match the daemon's configured Config.AdminToken; an

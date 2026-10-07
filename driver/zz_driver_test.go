@@ -42,7 +42,8 @@ type fakeDaemon struct {
 	conn     net.Conn
 	connSet  chan struct{} // closed once conn is stored in acceptLoop
 	mu       sync.Mutex
-	received [][]byte // all frames received
+	received [][]byte   // all frames received
+	wmu      sync.Mutex // serialises frame writes (replies and push)
 	handlers map[byte]func(frame []byte) [][]byte
 }
 
@@ -90,10 +91,23 @@ func (d *fakeDaemon) acceptLoop() {
 			}
 		}
 		d.mu.Unlock()
+		d.wmu.Lock()
 		for _, r := range resp {
 			_ = ipcutil.Write(conn, r)
 		}
+		d.wmu.Unlock()
 	}
+}
+
+// push writes frame to the driver unprompted, like a late reply.
+func (d *fakeDaemon) push(frame []byte) {
+	<-d.connSet
+	d.mu.Lock()
+	conn := d.conn
+	d.mu.Unlock()
+	d.wmu.Lock()
+	defer d.wmu.Unlock()
+	_ = ipcutil.Write(conn, frame)
 }
 
 func (d *fakeDaemon) onCmd(cmd byte, respond func(frame []byte) [][]byte) {

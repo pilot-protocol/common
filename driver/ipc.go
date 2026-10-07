@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,14 @@ const (
 	cmdSignEnvelopeOK   byte = 0x34
 	cmdVerifyEnvelope   byte = 0x35
 	cmdVerifyEnvelopeOK byte = 0x36
+	// 0x37/0x38 are the daemon's CmdUnbind/CmdUnbindOK.
+	//
+	// cmdSendToConfirm is cmdSendTo with a reply: cmdSendToOK once the
+	// daemon has handed the datagram to its tunnel, cmdError when it could
+	// not send it. Daemons that support it list "dgram_confirm" in the info
+	// reply's features; older daemons reply cmdError "unknown command".
+	cmdSendToConfirm byte = 0x39
+	cmdSendToOK      byte = 0x3A
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)
@@ -146,6 +155,13 @@ type ipcClient struct {
 	// while many goroutines are queued behind a slow sendAndWait.
 	waitSem chan struct{} // capacity 1
 
+	// confirmSem (capacity 1) is held by a confirmed send from before its
+	// request is written until its answer has arrived or the connection is
+	// gone, with no time limit: a confirmed send that timed out keeps the
+	// next one waiting until its late answer has gone by (see
+	// sendConfirmAndWait). Taken before waitSem.
+	confirmSem chan struct{}
+
 	// waiterMu guards the active-waiter slot. The IPC wire protocol has no
 	// request IDs and the daemon dispatches requests concurrently, so a
 	// reply that arrives AFTER its request timed out (or was abandoned)
@@ -165,6 +181,11 @@ type ipcClient struct {
 	// mitigation that keeps a late reply from being mis-delivered.
 	waiterMu     sync.Mutex
 	activeWaiter *ipcWaiter // current in-flight waiter, nil when idle
+	// confirmWaiter is the confirmed send (cmdSendToConfirm) whose answer is
+	// outstanding, nil when none is. Its answer is recognised by its content
+	// (isConfirmAnswer) and only ever delivered here, so it cannot be taken
+	// as some other request's reply, nor another request's for it.
+	confirmWaiter *ipcWaiter
 
 	recvMu     sync.Mutex
 	recvChs    map[uint32]chan []byte // conn_id → data channel
@@ -189,6 +210,7 @@ func newIPCClient(socketPath string) (*ipcClient, error) {
 	c := &ipcClient{
 		conn:       conn,
 		waitSem:    make(chan struct{}, 1),
+		confirmSem: make(chan struct{}, 1),
 		recvChs:    make(map[uint32]chan []byte),
 		pendRecv:   make(map[uint32][][]byte),
 		pendAccept: make(map[uint16][][]byte),
@@ -243,7 +265,7 @@ func (c *ipcClient) readLoop() {
 			cmdDeregisterOK, cmdSetTagsOK, cmdSetWebhookOK, cmdNetworkOK,
 			cmdHealthOK, cmdManagedOK, cmdRotateKeyOK, cmdBroadcastOK,
 			cmdPreferDirectOK, cmdSubmitBadgeOK, cmdEnrollRecoveryOK,
-			cmdSignEnvelopeOK, cmdVerifyEnvelopeOK:
+			cmdSignEnvelopeOK, cmdVerifyEnvelopeOK, cmdSendToOK:
 			// Known response cmds: deliver to the active sendAndWait waiter.
 			// If there is no active waiter (the request timed out / was
 			// abandoned, or this is a duplicate), the reply is dropped —
@@ -407,6 +429,16 @@ func (c *ipcClient) sendAndWait(data []byte, expectCmd byte) ([]byte, error) {
 // never blocks. When a frame is delivered the slot is cleared so a second
 // (duplicate) frame for the same request is dropped rather than re-delivered.
 func (c *ipcClient) deliverReply(resp *pendingResponse) {
+	if isConfirmAnswer(resp) {
+		c.waiterMu.Lock()
+		w := c.confirmWaiter
+		c.confirmWaiter = nil
+		c.waiterMu.Unlock()
+		if w != nil {
+			w.ch <- resp
+		}
+		return
+	}
 	c.waiterMu.Lock()
 	w := c.activeWaiter
 	if w == nil || (resp.cmd != w.expect && resp.cmd != cmdError) {
@@ -416,6 +448,96 @@ func (c *ipcClient) deliverReply(resp *pendingResponse) {
 	c.activeWaiter = nil
 	c.waiterMu.Unlock()
 	w.ch <- resp
+}
+
+// isConfirmAnswer reports whether resp is the daemon's answer to a confirmed
+// send: cmdSendToOK, or an error from its handler — "sendto: ..." from a
+// daemon that supports confirmed sends, "unknown command: 0x39" from one that
+// predates them. Fire-and-forget cmdSendTo is never answered, so nothing else
+// produces these.
+func isConfirmAnswer(resp *pendingResponse) bool {
+	if resp.cmd == cmdSendToOK {
+		return true
+	}
+	if resp.cmd != cmdError || len(resp.payload) < 2 {
+		return false
+	}
+	msg := string(resp.payload[2:])
+	return strings.HasPrefix(msg, "sendto: ") ||
+		strings.HasPrefix(msg, fmt.Sprintf("unknown command: 0x%02X", cmdSendToConfirm))
+}
+
+// sendConfirmAndWait writes a cmdSendToConfirm request and waits for its
+// answer. The IPC has no request IDs, so a confirmed send that times out is
+// still answered later. Its answer is recognised by content, so it can never
+// be taken as another kind of request's reply; to keep it from being taken as
+// the next confirmed send's, confirmSem stays held until it has arrived (or
+// the connection is gone). The caller gets its timeout at once and the
+// request/reply lane (waitSem) is released then, so other requests are not
+// held up; only the next confirmed send waits, and it gets
+// ErrConfirmQueueTimeout, nothing sent, if the answer never comes.
+//
+// queueTimeout bounds the wait for a turn, replyTimeout the wait for the
+// answer once the request is written — time spent queued behind another
+// request does not count against it.
+func (c *ipcClient) sendConfirmAndWait(data []byte, queueTimeout, replyTimeout time.Duration) (*pendingResponse, error) {
+	qt := time.NewTimer(queueTimeout)
+	defer qt.Stop()
+	select {
+	case c.confirmSem <- struct{}{}:
+	case <-c.doneCh:
+		return nil, fmt.Errorf("daemon disconnected")
+	case <-qt.C:
+		return nil, ErrConfirmQueueTimeout
+	}
+	select {
+	case c.waitSem <- struct{}{}:
+	case <-c.doneCh:
+		<-c.confirmSem
+		return nil, fmt.Errorf("daemon disconnected")
+	case <-qt.C:
+		<-c.confirmSem
+		return nil, ErrConfirmQueueTimeout
+	}
+	w := &ipcWaiter{expect: cmdSendToOK, ch: make(chan *pendingResponse, 1)}
+	c.waiterMu.Lock()
+	c.confirmWaiter = w
+	c.waiterMu.Unlock()
+	release := func() {
+		c.waiterMu.Lock()
+		if c.confirmWaiter == w {
+			c.confirmWaiter = nil
+		}
+		c.waiterMu.Unlock()
+		<-c.confirmSem
+	}
+	if err := c.writeFrame(data[0], data[1:]); err != nil {
+		<-c.waitSem
+		release()
+		return nil, err
+	}
+	rt := time.NewTimer(replyTimeout)
+	defer rt.Stop()
+	select {
+	case resp := <-w.ch:
+		<-c.waitSem
+		<-c.confirmSem
+		return resp, nil
+	case <-c.doneCh:
+		<-c.waitSem
+		release()
+		return nil, fmt.Errorf("daemon disconnected")
+	case <-rt.C:
+	}
+	<-c.waitSem
+	go func() {
+		select {
+		case <-w.ch:
+		case <-c.doneCh:
+		}
+		release()
+	}()
+	return nil, ErrConfirmTimeout
 }
 
 // registerWaiter installs a fresh active waiter for a request expecting
