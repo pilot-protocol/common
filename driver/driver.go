@@ -245,8 +245,9 @@ var sendToConfirmTimeout = defaultDialTimeout
 var ErrConfirmTimeout = errors.New("datagram send not confirmed: the daemon did not answer in time; it may or may not have been sent")
 
 // ErrConfirmQueueTimeout is returned by SendToConfirmed when it waited too
-// long for its turn on the Driver. Nothing was sent.
-var ErrConfirmQueueTimeout = errors.New("datagram not sent: timed out waiting behind other requests on this Driver")
+// long for its turn on the Driver: behind other requests, or for an earlier
+// confirmed send's late answer. Nothing was sent.
+var ErrConfirmQueueTimeout = errors.New("datagram not sent: timed out waiting for this Driver's earlier requests to be answered")
 
 // Broadcast fans an unreliable datagram out to every member of a network.
 // The admin token must match the daemon's configured Config.AdminToken; an
