@@ -195,6 +195,11 @@ func (d *Driver) SendTo(dst protocol.Addr, port uint16, data []byte) error {
 // Unlike SendTo this is a request/reply exchange, and a Driver runs one of
 // those at a time: a confirmed send waits behind an in-flight Dial on the
 // same Driver. Use SendTo where throughput matters more than the outcome.
+//
+// When the daemon does not answer in time the error says the outcome is
+// unknown, and this Driver's other requests wait until that late answer has
+// arrived (up to a minute): with no request IDs on the IPC, that is what keeps
+// it from being taken as the answer to the next confirmed send.
 func (d *Driver) SendToConfirmed(dst protocol.Addr, port uint16, data []byte) (confirmed bool, err error) {
 	if dst.IsBroadcast() {
 		return false, fmt.Errorf("broadcast address requires admin token: use Driver.Broadcast")
@@ -208,17 +213,35 @@ func (d *Driver) SendToConfirmed(dst protocol.Addr, port uint16, data []byte) (c
 	binary.BigEndian.PutUint16(msg[1+protocol.AddrSize:], port)
 	copy(msg[1+protocol.AddrSize+2:], data)
 
-	if _, err := d.ipc.sendAndWaitTimeout(msg, cmdSendToOK, defaultDialTimeout); err != nil {
-		if strings.Contains(err.Error(), fmt.Sprintf("unknown command: 0x%02X", cmdSendToConfirm)) {
-			// Older daemon: it rejected the command without sending
-			// anything, so fall back to the send it does understand.
-			d.noDgramConfirm.Store(true)
-			return false, d.SendTo(dst, port, data)
-		}
+	resp, err := d.ipc.sendConfirmAndWait(msg, sendToConfirmTimeout, sendToConfirmTimeout, sendToConfirmDrain)
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	if resp.cmd == cmdSendToOK {
+		return true, nil
+	}
+	text := ""
+	if len(resp.payload) >= 2 {
+		text = string(resp.payload[2:])
+	}
+	if strings.HasPrefix(text, fmt.Sprintf("unknown command: 0x%02X", cmdSendToConfirm)) {
+		// Older daemon: it rejected the command without sending anything,
+		// so fall back to the send it does understand.
+		d.noDgramConfirm.Store(true)
+		return false, d.SendTo(dst, port, data)
+	}
+	return false, fmt.Errorf("daemon: %s", text)
 }
+
+// sendToConfirmTimeout bounds how long SendToConfirmed waits for its turn on
+// the Driver, and then for the daemon's answer. sendToConfirmDrain bounds how
+// long, after a timeout, the Driver keeps waiting for that late answer before
+// it lets other requests through (see sendConfirmAndWait). Variables so tests
+// can shorten them.
+var (
+	sendToConfirmTimeout = defaultDialTimeout
+	sendToConfirmDrain   = 60 * time.Second
+)
 
 // Broadcast fans an unreliable datagram out to every member of a network.
 // The admin token must match the daemon's configured Config.AdminToken; an

@@ -4,8 +4,10 @@ package driver
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -173,6 +175,11 @@ type ipcClient struct {
 	// mitigation that keeps a late reply from being mis-delivered.
 	waiterMu     sync.Mutex
 	activeWaiter *ipcWaiter // current in-flight waiter, nil when idle
+	// confirmWaiter is the confirmed send (cmdSendToConfirm) whose answer is
+	// outstanding, nil when none is. Its answer is recognised by its content
+	// (isConfirmAnswer) and only ever delivered here, so it cannot be taken
+	// as some other request's reply, nor another request's for it.
+	confirmWaiter *ipcWaiter
 
 	recvMu     sync.Mutex
 	recvChs    map[uint32]chan []byte // conn_id → data channel
@@ -415,6 +422,16 @@ func (c *ipcClient) sendAndWait(data []byte, expectCmd byte) ([]byte, error) {
 // never blocks. When a frame is delivered the slot is cleared so a second
 // (duplicate) frame for the same request is dropped rather than re-delivered.
 func (c *ipcClient) deliverReply(resp *pendingResponse) {
+	if isConfirmAnswer(resp) {
+		c.waiterMu.Lock()
+		w := c.confirmWaiter
+		c.confirmWaiter = nil
+		c.waiterMu.Unlock()
+		if w != nil {
+			w.ch <- resp
+		}
+		return
+	}
 	c.waiterMu.Lock()
 	w := c.activeWaiter
 	if w == nil || (resp.cmd != w.expect && resp.cmd != cmdError) {
@@ -425,6 +442,95 @@ func (c *ipcClient) deliverReply(resp *pendingResponse) {
 	c.waiterMu.Unlock()
 	w.ch <- resp
 }
+
+// isConfirmAnswer reports whether resp is the daemon's answer to a confirmed
+// send: cmdSendToOK, or an error from its handler — "sendto: ..." from a
+// daemon that supports confirmed sends, "unknown command: 0x39" from one that
+// predates them. Fire-and-forget cmdSendTo is never answered, so nothing else
+// produces these.
+func isConfirmAnswer(resp *pendingResponse) bool {
+	if resp.cmd == cmdSendToOK {
+		return true
+	}
+	if resp.cmd != cmdError || len(resp.payload) < 2 {
+		return false
+	}
+	msg := string(resp.payload[2:])
+	return strings.HasPrefix(msg, "sendto: ") ||
+		strings.HasPrefix(msg, fmt.Sprintf("unknown command: 0x%02X", cmdSendToConfirm))
+}
+
+// sendConfirmAndWait writes a cmdSendToConfirm request and waits for its
+// answer. The IPC has no request IDs, so a confirmed send that times out is
+// still answered later. To keep that late answer from being taken as the next
+// confirmed send's, the request/reply lane (waitSem) stays held until it has
+// arrived, or until drain has passed: the daemon answers confirmed sends in
+// order and always answers, so the next confirmed send waits for that answer
+// to go by first. The caller gets its timeout at once; the lane is released
+// in the background.
+//
+// queueTimeout bounds the wait for the lane, replyTimeout the wait for the
+// answer once the request is written — time spent queued behind another
+// request does not count against it.
+func (c *ipcClient) sendConfirmAndWait(data []byte, queueTimeout, replyTimeout, drain time.Duration) (*pendingResponse, error) {
+	qt := time.NewTimer(queueTimeout)
+	defer qt.Stop()
+	select {
+	case c.waitSem <- struct{}{}:
+	case <-c.doneCh:
+		return nil, fmt.Errorf("daemon disconnected")
+	case <-qt.C:
+		return nil, errConfirmQueueTimeout
+	}
+	w := &ipcWaiter{expect: cmdSendToOK, ch: make(chan *pendingResponse, 1)}
+	c.waiterMu.Lock()
+	c.confirmWaiter = w
+	c.waiterMu.Unlock()
+	clear := func() {
+		c.waiterMu.Lock()
+		if c.confirmWaiter == w {
+			c.confirmWaiter = nil
+		}
+		c.waiterMu.Unlock()
+	}
+	if err := c.writeFrame(data[0], data[1:]); err != nil {
+		clear()
+		<-c.waitSem
+		return nil, err
+	}
+	rt := time.NewTimer(replyTimeout)
+	defer rt.Stop()
+	select {
+	case resp := <-w.ch:
+		<-c.waitSem
+		return resp, nil
+	case <-c.doneCh:
+		clear()
+		<-c.waitSem
+		return nil, fmt.Errorf("daemon disconnected")
+	case <-rt.C:
+	}
+	go func() {
+		dt := time.NewTimer(drain)
+		defer dt.Stop()
+		select {
+		case <-w.ch:
+		case <-c.doneCh:
+		case <-dt.C:
+			clear()
+		}
+		<-c.waitSem
+	}()
+	return nil, errConfirmTimeout
+}
+
+// errConfirmTimeout: the daemon did not answer a confirmed send in time. The
+// datagram may or may not have been sent.
+var errConfirmTimeout = errors.New("datagram send not confirmed: the daemon did not answer in time; it may or may not have been sent")
+
+// errConfirmQueueTimeout: a confirmed send waited too long behind other
+// requests on this Driver; nothing was sent.
+var errConfirmQueueTimeout = errors.New("datagram not sent: timed out waiting behind other requests on this Driver")
 
 // registerWaiter installs a fresh active waiter for a request expecting
 // expect (or cmdError) and returns it. Any previous waiter is replaced;
