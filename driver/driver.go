@@ -5,6 +5,7 @@ package driver
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -186,8 +187,9 @@ func (d *Driver) SendTo(dst protocol.Addr, port uint16, data []byte) error {
 //   - (true, nil): the daemon handed the datagram to its tunnel. Datagrams
 //     are unreliable, so this still says nothing about delivery to the peer.
 //   - (false, err): the daemon could not send it (no route to the node, port
-//     policy, ephemeral ports exhausted, ...), or did not answer in time —
-//     in which case the datagram may or may not have left.
+//     policy, ephemeral ports exhausted, ...), or did not answer in time
+//     (ErrConfirmTimeout: the datagram may or may not have left), or this
+//     call never got its turn (ErrConfirmQueueTimeout: nothing was sent).
 //   - (false, nil): the daemon predates confirmed sends (no "dgram_confirm"
 //     feature). The datagram was written with the legacy fire-and-forget
 //     command, exactly as SendTo does, and its outcome is unknown.
@@ -196,10 +198,10 @@ func (d *Driver) SendTo(dst protocol.Addr, port uint16, data []byte) error {
 // those at a time: a confirmed send waits behind an in-flight Dial on the
 // same Driver. Use SendTo where throughput matters more than the outcome.
 //
-// When the daemon does not answer in time the error says the outcome is
-// unknown, and this Driver's other requests wait until that late answer has
-// arrived (up to a minute): with no request IDs on the IPC, that is what keeps
-// it from being taken as the answer to the next confirmed send.
+// When the daemon does not answer in time, the next confirmed send on this
+// Driver waits until that late answer has arrived: with no request IDs on the
+// IPC, that is what keeps it from being taken as the next one's answer. Other
+// requests are not held up.
 func (d *Driver) SendToConfirmed(dst protocol.Addr, port uint16, data []byte) (confirmed bool, err error) {
 	if dst.IsBroadcast() {
 		return false, fmt.Errorf("broadcast address requires admin token: use Driver.Broadcast")
@@ -213,7 +215,7 @@ func (d *Driver) SendToConfirmed(dst protocol.Addr, port uint16, data []byte) (c
 	binary.BigEndian.PutUint16(msg[1+protocol.AddrSize:], port)
 	copy(msg[1+protocol.AddrSize+2:], data)
 
-	resp, err := d.ipc.sendConfirmAndWait(msg, sendToConfirmTimeout, sendToConfirmTimeout, sendToConfirmDrain)
+	resp, err := d.ipc.sendConfirmAndWait(msg, sendToConfirmTimeout, sendToConfirmTimeout)
 	if err != nil {
 		return false, err
 	}
@@ -234,14 +236,17 @@ func (d *Driver) SendToConfirmed(dst protocol.Addr, port uint16, data []byte) (c
 }
 
 // sendToConfirmTimeout bounds how long SendToConfirmed waits for its turn on
-// the Driver, and then for the daemon's answer. sendToConfirmDrain bounds how
-// long, after a timeout, the Driver keeps waiting for that late answer before
-// it lets other requests through (see sendConfirmAndWait). Variables so tests
-// can shorten them.
-var (
-	sendToConfirmTimeout = defaultDialTimeout
-	sendToConfirmDrain   = 60 * time.Second
-)
+// the Driver, and then for the daemon's answer. A variable so tests can
+// shorten it.
+var sendToConfirmTimeout = defaultDialTimeout
+
+// ErrConfirmTimeout is returned by SendToConfirmed when the daemon did not
+// answer in time. The datagram may or may not have been sent.
+var ErrConfirmTimeout = errors.New("datagram send not confirmed: the daemon did not answer in time; it may or may not have been sent")
+
+// ErrConfirmQueueTimeout is returned by SendToConfirmed when it waited too
+// long for its turn on the Driver. Nothing was sent.
+var ErrConfirmQueueTimeout = errors.New("datagram not sent: timed out waiting behind other requests on this Driver")
 
 // Broadcast fans an unreliable datagram out to every member of a network.
 // The admin token must match the daemon's configured Config.AdminToken; an

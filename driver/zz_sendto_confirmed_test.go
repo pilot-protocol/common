@@ -3,6 +3,7 @@
 package driver
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -116,13 +117,13 @@ func TestSendToConfirmedFallsBackOnOlderDaemon(t *testing.T) {
 	}
 }
 
-// shortConfirmTimeouts makes SendToConfirmed time out after timeout and let
-// other requests through drain after that, for the duration of the test.
-func shortConfirmTimeouts(t *testing.T, timeout, drain time.Duration) {
+// shortConfirmTimeout makes SendToConfirmed time out after timeout, for the
+// duration of the test.
+func shortConfirmTimeout(t *testing.T, timeout time.Duration) {
 	t.Helper()
-	ot, od := sendToConfirmTimeout, sendToConfirmDrain
-	sendToConfirmTimeout, sendToConfirmDrain = timeout, drain
-	t.Cleanup(func() { sendToConfirmTimeout, sendToConfirmDrain = ot, od })
+	ot := sendToConfirmTimeout
+	sendToConfirmTimeout = timeout
+	t.Cleanup(func() { sendToConfirmTimeout = ot })
 }
 
 // A confirmed send that times out is answered by the daemon later; that
@@ -130,7 +131,7 @@ func shortConfirmTimeouts(t *testing.T, timeout, drain time.Duration) {
 // that the daemon rejected came back confirmed=true because it received the
 // first send's late OK.
 func TestSendToConfirmedLateOKIsNotTheNextSendsAnswer(t *testing.T) {
-	shortConfirmTimeouts(t, 200*time.Millisecond, 5*time.Second)
+	shortConfirmTimeout(t, 200*time.Millisecond)
 	d := newFakeDaemon(t)
 	defer d.close()
 	calls := 0
@@ -149,8 +150,8 @@ func TestSendToConfirmedLateOKIsNotTheNextSendsAnswer(t *testing.T) {
 	defer drv.Close()
 	dst := protocol.Addr{Network: 0, Node: 7}
 
-	if ok, err := drv.SendToConfirmed(dst, 5000, []byte("first")); ok || err == nil || !strings.Contains(err.Error(), "may or may not") {
-		t.Fatalf("first send = (%v, %v), want a timeout saying the outcome is unknown", ok, err)
+	if ok, err := drv.SendToConfirmed(dst, 5000, []byte("first")); ok || !errors.Is(err, ErrConfirmTimeout) {
+		t.Fatalf("first send = (%v, %v), want ErrConfirmTimeout", ok, err)
 	}
 	ok, err := drv.SendToConfirmed(dst, 5000, []byte("second"))
 	if ok || err == nil || !strings.Contains(err.Error(), "not allowed") {
@@ -162,7 +163,7 @@ func TestSendToConfirmedLateOKIsNotTheNextSendsAnswer(t *testing.T) {
 // leave the Driver convinced an answer was still owed, after which every
 // confirmed send timed out. The next send must get its own answer.
 func TestSendToConfirmedLateErrorWhileIdleDoesNotWedgeTheDriver(t *testing.T) {
-	shortConfirmTimeouts(t, 100*time.Millisecond, 5*time.Second)
+	shortConfirmTimeout(t, 100*time.Millisecond)
 	d := newFakeDaemon(t)
 	defer d.close()
 	calls := 0
@@ -193,10 +194,9 @@ func TestSendToConfirmedLateErrorWhileIdleDoesNotWedgeTheDriver(t *testing.T) {
 }
 
 // A late error from a different request (here an Info that timed out) is
-// never taken as a confirmed send's answer, and a confirmed send's late
-// answer never reaches another request.
+// never taken as a confirmed send's answer.
 func TestSendToConfirmedNeverTakesAnotherRequestsAnswer(t *testing.T) {
-	shortConfirmTimeouts(t, 2*time.Second, 5*time.Second)
+	shortConfirmTimeout(t, 2*time.Second)
 	d := newFakeDaemon(t)
 	defer d.close()
 	d.onCmd(cmdInfo, func(frame []byte) [][]byte {
@@ -226,7 +226,7 @@ func TestSendToConfirmedNeverTakesAnotherRequestsAnswer(t *testing.T) {
 // out must not stop the fallback: the next call still learns the daemon is
 // old and sends the datagram the legacy way.
 func TestSendToConfirmedFallsBackAfterALegacyProbeTimedOut(t *testing.T) {
-	shortConfirmTimeouts(t, 200*time.Millisecond, 5*time.Second)
+	shortConfirmTimeout(t, 200*time.Millisecond)
 	d := newFakeDaemon(t)
 	defer d.close()
 	calls := 0
@@ -266,7 +266,7 @@ func TestSendToConfirmedFallsBackAfterALegacyProbeTimedOut(t *testing.T) {
 // Time spent queued behind another request does not count against the wait
 // for the daemon's answer.
 func TestSendToConfirmedReplyWaitStartsWhenTheRequestIsWritten(t *testing.T) {
-	shortConfirmTimeouts(t, 300*time.Millisecond, 5*time.Second)
+	shortConfirmTimeout(t, 300*time.Millisecond)
 	d := newFakeDaemon(t)
 	defer d.close()
 	d.onCmd(cmdInfo, func(frame []byte) [][]byte {
@@ -293,5 +293,142 @@ func TestSendToConfirmedReplyWaitStartsWhenTheRequestIsWritten(t *testing.T) {
 	<-infoDone
 	if err != nil || !ok {
 		t.Fatalf("confirmed send queued ~230ms behind an Info and answered 150ms after its write = (%v, %v), want (true, nil)", ok, err)
+	}
+}
+
+// A confirmed send's late answer never reaches another kind of request, and
+// waiting for it does not hold other requests up: an Info sent while the
+// answer is still owed gets its own reply, even when the late answer is an
+// error frame arriving just before it.
+func TestSendToConfirmedLateAnswerDoesNotReachOrHoldOtherRequests(t *testing.T) {
+	shortConfirmTimeout(t, 100*time.Millisecond)
+	d := newFakeDaemon(t)
+	defer d.close()
+	answered := false
+	d.onCmd(cmdSendToConfirm, func(frame []byte) [][]byte {
+		if !answered {
+			return nil // answered late, below
+		}
+		return [][]byte{{cmdSendToOK}}
+	})
+	infoOK := append([]byte{cmdInfoOK}, `{"node_id":7}`...)
+	d.onCmd(cmdInfo, func(frame []byte) [][]byte {
+		return [][]byte{infoOK}
+	})
+	drv, err := Connect(d.path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer drv.Close()
+	dst := protocol.Addr{Network: 0, Node: 7}
+
+	if _, err := drv.SendToConfirmed(dst, 5000, []byte("x")); !errors.Is(err, ErrConfirmTimeout) {
+		t.Fatalf("confirmed send = %v, want ErrConfirmTimeout", err)
+	}
+	// The answer is still owed. An Info is not held up by it...
+	start := time.Now()
+	if _, err := drv.Info(); err != nil {
+		t.Fatalf("Info while a confirmed send's answer is owed: %v", err)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Errorf("Info waited %s behind an unanswered confirmed send", waited)
+	}
+	// ...and the late error, arriving just before an Info's reply, is not
+	// taken as that reply.
+	d.onCmd(cmdInfo, func(frame []byte) [][]byte {
+		answered = true
+		return [][]byte{ipcErrorFrame("sendto: resolve node 7: not found"), infoOK}
+	})
+	info, err := drv.Info()
+	if err != nil {
+		t.Fatalf("Info took the confirmed send's late error as its reply: %v", err)
+	}
+	if info["node_id"] != float64(7) {
+		t.Errorf("Info = %v", info)
+	}
+	// The late answer has gone by, so the next confirmed send gets its own.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ok, err := drv.SendToConfirmed(dst, 5000, []byte("y"))
+		if errors.Is(err, ErrConfirmQueueTimeout) && time.Now().Before(deadline) {
+			continue
+		}
+		if err != nil || !ok {
+			t.Fatalf("send after the late answer = (%v, %v), want (true, nil)", ok, err)
+		}
+		break
+	}
+}
+
+// The next confirmed send waits for a late answer however late it is: while
+// it is owed, the next send gets ErrConfirmQueueTimeout and nothing is
+// written; once it arrives, the next send gets its own answer. In review, a
+// time limit on that wait let a very late OK become the next send's answer.
+func TestSendToConfirmedWaitsOutAVeryLateAnswer(t *testing.T) {
+	shortConfirmTimeout(t, 100*time.Millisecond)
+	d := newFakeDaemon(t)
+	defer d.close()
+	calls := 0
+	d.onCmd(cmdSendToConfirm, func(frame []byte) [][]byte {
+		calls++
+		if calls == 1 {
+			return nil // answered late, below
+		}
+		return [][]byte{ipcErrorFrame("sendto: port 5000 not allowed by network 0 policy")}
+	})
+	drv, err := Connect(d.path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer drv.Close()
+	dst := protocol.Addr{Network: 0, Node: 7}
+
+	if _, err := drv.SendToConfirmed(dst, 5000, []byte("first")); !errors.Is(err, ErrConfirmTimeout) {
+		t.Fatalf("first send = %v, want ErrConfirmTimeout", err)
+	}
+	for i := 0; i < 3; i++ {
+		if ok, err := drv.SendToConfirmed(dst, 5000, []byte("waits")); ok || !errors.Is(err, ErrConfirmQueueTimeout) {
+			t.Fatalf("send while the first answer is owed = (%v, %v), want ErrConfirmQueueTimeout", ok, err)
+		}
+	}
+	if n := framesOf(d, cmdSendToConfirm); n != 1 {
+		t.Fatalf("%d confirmed sends written while an answer was owed, want only the first", n)
+	}
+	d.push([]byte{cmdSendToOK}) // the first send's very late OK
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ok, err := drv.SendToConfirmed(dst, 5000, []byte("second"))
+		if errors.Is(err, ErrConfirmQueueTimeout) && time.Now().Before(deadline) {
+			continue // the late OK is still on its way
+		}
+		if ok || err == nil || !strings.Contains(err.Error(), "not allowed") {
+			t.Fatalf("send after the late OK = (%v, %v), want its own rejection", ok, err)
+		}
+		break
+	}
+}
+
+// Closing the Driver while a late answer is owed releases the waiter: later
+// calls fail at once instead of queueing.
+func TestSendToConfirmedCloseWhileAnAnswerIsOwed(t *testing.T) {
+	shortConfirmTimeout(t, 100*time.Millisecond)
+	d := newFakeDaemon(t)
+	defer d.close()
+	d.onCmd(cmdSendToConfirm, func(frame []byte) [][]byte { return nil })
+	drv, err := Connect(d.path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	dst := protocol.Addr{Network: 0, Node: 7}
+	if _, err := drv.SendToConfirmed(dst, 5000, []byte("x")); !errors.Is(err, ErrConfirmTimeout) {
+		t.Fatalf("send = %v, want ErrConfirmTimeout", err)
+	}
+	drv.Close()
+	start := time.Now()
+	if _, err := drv.SendToConfirmed(dst, 5000, []byte("x")); err == nil || errors.Is(err, ErrConfirmQueueTimeout) {
+		t.Fatalf("send after Close = %v, want a disconnect error", err)
+	}
+	if waited := time.Since(start); waited > 50*time.Millisecond {
+		t.Errorf("send after Close took %s", waited)
 	}
 }

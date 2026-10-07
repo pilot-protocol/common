@@ -4,7 +4,6 @@ package driver
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -156,6 +155,13 @@ type ipcClient struct {
 	// while many goroutines are queued behind a slow sendAndWait.
 	waitSem chan struct{} // capacity 1
 
+	// confirmSem (capacity 1) is held by a confirmed send from before its
+	// request is written until its answer has arrived or the connection is
+	// gone, with no time limit: a confirmed send that timed out keeps the
+	// next one waiting until its late answer has gone by (see
+	// sendConfirmAndWait). Taken before waitSem.
+	confirmSem chan struct{}
+
 	// waiterMu guards the active-waiter slot. The IPC wire protocol has no
 	// request IDs and the daemon dispatches requests concurrently, so a
 	// reply that arrives AFTER its request timed out (or was abandoned)
@@ -204,6 +210,7 @@ func newIPCClient(socketPath string) (*ipcClient, error) {
 	c := &ipcClient{
 		conn:       conn,
 		waitSem:    make(chan struct{}, 1),
+		confirmSem: make(chan struct{}, 1),
 		recvChs:    make(map[uint32]chan []byte),
 		pendRecv:   make(map[uint32][][]byte),
 		pendAccept: make(map[uint16][][]byte),
@@ -462,40 +469,51 @@ func isConfirmAnswer(resp *pendingResponse) bool {
 
 // sendConfirmAndWait writes a cmdSendToConfirm request and waits for its
 // answer. The IPC has no request IDs, so a confirmed send that times out is
-// still answered later. To keep that late answer from being taken as the next
-// confirmed send's, the request/reply lane (waitSem) stays held until it has
-// arrived, or until drain has passed: the daemon answers confirmed sends in
-// order and always answers, so the next confirmed send waits for that answer
-// to go by first. The caller gets its timeout at once; the lane is released
-// in the background.
+// still answered later. Its answer is recognised by content, so it can never
+// be taken as another kind of request's reply; to keep it from being taken as
+// the next confirmed send's, confirmSem stays held until it has arrived (or
+// the connection is gone). The caller gets its timeout at once and the
+// request/reply lane (waitSem) is released then, so other requests are not
+// held up; only the next confirmed send waits, and it gets
+// ErrConfirmQueueTimeout, nothing sent, if the answer never comes.
 //
-// queueTimeout bounds the wait for the lane, replyTimeout the wait for the
+// queueTimeout bounds the wait for a turn, replyTimeout the wait for the
 // answer once the request is written — time spent queued behind another
 // request does not count against it.
-func (c *ipcClient) sendConfirmAndWait(data []byte, queueTimeout, replyTimeout, drain time.Duration) (*pendingResponse, error) {
+func (c *ipcClient) sendConfirmAndWait(data []byte, queueTimeout, replyTimeout time.Duration) (*pendingResponse, error) {
 	qt := time.NewTimer(queueTimeout)
 	defer qt.Stop()
 	select {
-	case c.waitSem <- struct{}{}:
+	case c.confirmSem <- struct{}{}:
 	case <-c.doneCh:
 		return nil, fmt.Errorf("daemon disconnected")
 	case <-qt.C:
-		return nil, errConfirmQueueTimeout
+		return nil, ErrConfirmQueueTimeout
+	}
+	select {
+	case c.waitSem <- struct{}{}:
+	case <-c.doneCh:
+		<-c.confirmSem
+		return nil, fmt.Errorf("daemon disconnected")
+	case <-qt.C:
+		<-c.confirmSem
+		return nil, ErrConfirmQueueTimeout
 	}
 	w := &ipcWaiter{expect: cmdSendToOK, ch: make(chan *pendingResponse, 1)}
 	c.waiterMu.Lock()
 	c.confirmWaiter = w
 	c.waiterMu.Unlock()
-	clear := func() {
+	release := func() {
 		c.waiterMu.Lock()
 		if c.confirmWaiter == w {
 			c.confirmWaiter = nil
 		}
 		c.waiterMu.Unlock()
+		<-c.confirmSem
 	}
 	if err := c.writeFrame(data[0], data[1:]); err != nil {
-		clear()
 		<-c.waitSem
+		release()
 		return nil, err
 	}
 	rt := time.NewTimer(replyTimeout)
@@ -503,34 +521,24 @@ func (c *ipcClient) sendConfirmAndWait(data []byte, queueTimeout, replyTimeout, 
 	select {
 	case resp := <-w.ch:
 		<-c.waitSem
+		<-c.confirmSem
 		return resp, nil
 	case <-c.doneCh:
-		clear()
 		<-c.waitSem
+		release()
 		return nil, fmt.Errorf("daemon disconnected")
 	case <-rt.C:
 	}
+	<-c.waitSem
 	go func() {
-		dt := time.NewTimer(drain)
-		defer dt.Stop()
 		select {
 		case <-w.ch:
 		case <-c.doneCh:
-		case <-dt.C:
-			clear()
 		}
-		<-c.waitSem
+		release()
 	}()
-	return nil, errConfirmTimeout
+	return nil, ErrConfirmTimeout
 }
-
-// errConfirmTimeout: the daemon did not answer a confirmed send in time. The
-// datagram may or may not have been sent.
-var errConfirmTimeout = errors.New("datagram send not confirmed: the daemon did not answer in time; it may or may not have been sent")
-
-// errConfirmQueueTimeout: a confirmed send waited too long behind other
-// requests on this Driver; nothing was sent.
-var errConfirmQueueTimeout = errors.New("datagram not sent: timed out waiting behind other requests on this Driver")
 
 // registerWaiter installs a fresh active waiter for a request expecting
 // expect (or cmdError) and returns it. Any previous waiter is replaced;
